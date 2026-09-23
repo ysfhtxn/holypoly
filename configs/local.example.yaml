@@ -1,0 +1,5 @@
+# Copy this file to configs/local.yaml and replace the placeholders.
+# Do not commit machine-specific paths or real sample information.
+paths:
+  data_root: /path/to/read-only/data
+  work_root: /path/to/writable/work

@@ -1,0 +1,51 @@
+[project]
+name = "holypoly"
+version = "0.1.0"
+description = "Nanopore poly(A/T) data preparation and diagnostics."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0.2",
+]
+
+[project.scripts]
+holypoly = "holypoly.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.2",
+    "pytest>=8.4.2",
+    "ruff>=0.13.2",
+    "types-pyyaml>=6.0.12.20250915",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+exclude = ["src/bonito"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/holypoly"]
+exclude = ["^src/bonito/"]
+
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "holypoly.poly_heads"
+disallow_subclassing_any = false
+warn_return_any = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tests/torch"]

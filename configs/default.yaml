@@ -1,0 +1,21 @@
+paths:
+  data_root: null
+  work_root: null
+  pod5_dir: pod5
+  basecalls_dir: basecalls
+  reference_path: fixed_len_ref.fa
+  processed_dir: processed
+  metadata_dir: metadata
+  results_dir: results
+  models_dir: models
+  logs_dir: logs
+  cache_dir: cache
+
+doctor:
+  sample_size: 3
+
+model:
+  auxiliary_loss:
+    lambda_location: 1.0
+    lambda_length: 1.0
+    lambda_status: 1.0
