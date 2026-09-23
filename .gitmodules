@@ -1,0 +1,3 @@
+[submodule "src/bonito"]
+	path = src/bonito
+	url = https://github.com/nanoporetech/bonito.git
