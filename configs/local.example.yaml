@@ -3,3 +3,10 @@
 paths:
   data_root: /path/to/read-only/data
   work_root: /path/to/writable/work
+
+# Training paths may also be provided through HOLYPOLY_M3_MANIFEST,
+# HOLYPOLY_BONITO_MODEL, and HOLYPOLY_M3_CHECKPOINT.
+training:
+  manifest_path: metadata/training-manifest.tsv
+  bonito_model: models/bonito-v5
+  checkpoint_path: models/holypoly-heads.pt

@@ -123,3 +123,48 @@ model:
     )
     with pytest.raises(ConfigError, match="must be non-negative"):
         load_config(local_path, default_path=default_path, environ={})
+
+
+def test_training_paths_use_environment_precedence(tmp_path: Path) -> None:
+    default_path = tmp_path / "default.yaml"
+    _write_default(
+        default_path,
+        tmp_path / "data",
+        tmp_path / "work",
+    )
+    local_path = tmp_path / "local.yaml"
+    local_path.write_text(
+        "training:\n"
+        "  manifest_path: local.tsv\n"
+        "  bonito_model: local-model\n"
+        "  checkpoint_path: local.pt\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        local_path,
+        default_path=default_path,
+        environ={
+            "HOLYPOLY_M3_MANIFEST": str(tmp_path / "environment.tsv"),
+            "HOLYPOLY_BONITO_MODEL": str(tmp_path / "environment-model"),
+            "HOLYPOLY_M3_CHECKPOINT": str(tmp_path / "environment.pt"),
+        },
+    )
+
+    assert config.training.manifest_path == tmp_path / "environment.tsv"
+    assert config.training.bonito_model == tmp_path / "environment-model"
+    assert config.training.checkpoint_path == tmp_path / "environment.pt"
+
+
+def test_invalid_training_device_is_rejected(tmp_path: Path) -> None:
+    default_path = tmp_path / "default.yaml"
+    _write_default(
+        default_path,
+        tmp_path / "data",
+        tmp_path / "work",
+    )
+    local_path = tmp_path / "local.yaml"
+    local_path.write_text("training:\n  device: cuda:1\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="must be cuda:0"):
+        load_config(local_path, default_path=default_path, environ={})

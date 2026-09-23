@@ -237,10 +237,18 @@ def load_checkpoint(
     )
 
 
-def append_loss_log(path: Path, result: EpochResult, *, epoch: int) -> None:
+def append_loss_log(
+    path: Path,
+    result: EpochResult,
+    *,
+    epoch: int,
+    split: str | None = None,
+) -> None:
     """Append one JSON record containing every loss and metric."""
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {"epoch": epoch, **asdict(result)}
+    if split is not None:
+        record["split"] = split
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 

@@ -38,7 +38,17 @@ files = ["src/holypoly"]
 exclude = ["^src/bonito/"]
 
 [[tool.mypy.overrides]]
-module = ["bonito", "bonito.*", "pod5", "pod5.*", "torch", "torch.*"]
+module = [
+    "bonito",
+    "bonito.*",
+    "pod5",
+    "pod5.*",
+    "pysam",
+    "pysam.*",
+    "toml",
+    "torch",
+    "torch.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

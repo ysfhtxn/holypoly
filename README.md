@@ -133,3 +133,51 @@ Transformer、upsample 和原 CRF head，仅让 location/length 两个 Poly head
 观察长度和实际训练目标。当前 2p5per smoke 使用构建级 20 nt 弱监督与 provisional
 flank，只验证 POD5→Dataset→model→loss→backward→checkpoint 链路，不用于报告
 正式 MAE 或泛化能力。
+
+### 训练命令
+
+训练依赖继续保留在 `src/bonito/.venv`。父项目的 `holypoly train` 只负责读取配置、
+验证路径并在该独立环境中启动训练，不会把 Torch、POD5 或 Bonito 安装到父环境。
+
+先配置外部路径并执行只读预检：
+
+```bash
+export HOLYPOLY_DATA_ROOT=/path/to/read-only/data
+export HOLYPOLY_WORK_ROOT=/path/to/writable/work
+export HOLYPOLY_M3_MANIFEST=/path/to/writable/work/metadata/train.tsv
+export HOLYPOLY_BONITO_MODEL=/path/to/writable/work/models/bonito-v5
+export HOLYPOLY_M3_CHECKPOINT=/path/to/writable/work/models/holypoly-heads.pt
+export CUDA_VISIBLE_DEVICES=<physical-gpu-id>
+
+uv run holypoly train --dry-run
+```
+
+`--dry-run` 只读取 manifest 元数据和 Bonito `config.toml` 的存在性，不读取 POD5
+signal、不加载模型权重，也不创建 checkpoint。预检通过后运行：
+
+```bash
+uv run holypoly train --epochs 10 --batch-size 4
+```
+
+训练固定使用映射后的 `cuda:0`。继续已有 checkpoint 使用 `--resume`；重新开始并
+允许覆盖已有输出必须显式使用 `--overwrite`。相对的 manifest、模型、checkpoint 和
+日志路径均相对于 `work_root` 解释，checkpoint 和日志强制写在 `work_root` 内。
+train、validation 和 test 可以引用同一 POD5 文件，但不同 split 之间不得包含重复的
+`read_id`。
+
+## 按参考名称整理标称长度数据
+
+`src/holypoly/length_groups.py` 从 Dorado BAM 的比对参考名称中解析 `<number>A`，
+并将 primary read 整理为按 `nominal_length_nt` 分组的压缩 TSV。该步骤只引用原
+BAM/POD5 路径，不复制或修改原始文件，也不会把构建标称长度描述为逐 read 真值。
+
+```bash
+PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.length_groups \
+  --data-root /path/to/fixed_len_data \
+  --reference /path/to/fixed_len_data/fixed_len_ref.fa \
+  --output-dir /path/to/fixed_len_data/derived/nominal_length_groups_v1
+```
+
+输出包含每个长度的 `reads.tsv.gz`、未比对 read 的 `unassigned/reads.tsv.gz`、参考
+序列目录和汇总 JSON。该结果仅完成 read-level 标称长度分类，尚不包含 location head
+训练需要的 signal-level Poly 区间。

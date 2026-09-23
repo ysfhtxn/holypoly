@@ -13,6 +13,9 @@ import yaml
 DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 DATA_ROOT_ENV = "HOLYPOLY_DATA_ROOT"
 WORK_ROOT_ENV = "HOLYPOLY_WORK_ROOT"
+M3_MANIFEST_ENV = "HOLYPOLY_M3_MANIFEST"
+BONITO_MODEL_ENV = "HOLYPOLY_BONITO_MODEL"
+M3_CHECKPOINT_ENV = "HOLYPOLY_M3_CHECKPOINT"
 
 
 class ConfigError(ValueError):
@@ -65,12 +68,34 @@ class AuxiliaryLossConfig:
 
 
 @dataclass(frozen=True)
+class TrainingConfig:
+    """Single-GPU frozen-encoder training settings."""
+
+    manifest_path: Path | None = None
+    bonito_model: Path | None = None
+    checkpoint_path: Path | None = None
+    loss_log_path: Path = Path("logs/train.jsonl")
+    epochs: int = 1
+    batch_size: int = 1
+    chunk_size_samples: int = 12000
+    hidden_features: int = 128
+    dropout: float = 0.0
+    learning_rate: float = 1e-3
+    weight_decay: float = 0.0
+    gradient_clip_norm: float = 2.0
+    random_seed: int = 20260923
+    num_workers: int = 0
+    device: str = "cuda:0"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Complete application configuration."""
 
     paths: PathsConfig
     doctor: DoctorConfig
     auxiliary_loss: AuxiliaryLossConfig = AuxiliaryLossConfig()
+    training: TrainingConfig = TrainingConfig()
 
 
 def load_config(
@@ -97,6 +122,7 @@ def load_config(
     doctor_values = _mapping_value(merged, "doctor")
     model_values = _mapping_value(merged, "model")
     auxiliary_loss_values = _mapping_value(model_values, "auxiliary_loss")
+    training_values = _mapping_value(merged, "training")
     active_environ = os.environ if environ is None else environ
 
     data_root = _optional_path(paths_values.get("data_root"), "paths.data_root")
@@ -109,6 +135,26 @@ def load_config(
         data_root = cli_data_root.expanduser()
     if cli_work_root is not None:
         work_root = cli_work_root.expanduser()
+
+    manifest_path = _optional_path(
+        training_values.get("manifest_path"), "training.manifest_path"
+    )
+    bonito_model = _optional_path(
+        training_values.get("bonito_model"), "training.bonito_model"
+    )
+    checkpoint_path = _optional_path(
+        training_values.get("checkpoint_path"), "training.checkpoint_path"
+    )
+    if M3_MANIFEST_ENV in active_environ:
+        manifest_path = _required_path(active_environ[M3_MANIFEST_ENV], M3_MANIFEST_ENV)
+    if BONITO_MODEL_ENV in active_environ:
+        bonito_model = _required_path(
+            active_environ[BONITO_MODEL_ENV], BONITO_MODEL_ENV
+        )
+    if M3_CHECKPOINT_ENV in active_environ:
+        checkpoint_path = _required_path(
+            active_environ[M3_CHECKPOINT_ENV], M3_CHECKPOINT_ENV
+        )
 
     sample_size = doctor_values.get("sample_size", 3)
     if not isinstance(sample_size, int) or isinstance(sample_size, bool):
@@ -156,6 +202,55 @@ def load_config(
                 auxiliary_loss_values.get("lambda_status", 1.0),
                 "model.auxiliary_loss.lambda_status",
             ),
+        ),
+        training=TrainingConfig(
+            manifest_path=manifest_path,
+            bonito_model=bonito_model,
+            checkpoint_path=checkpoint_path,
+            loss_log_path=_required_path(
+                training_values.get("loss_log_path", "logs/train.jsonl"),
+                "training.loss_log_path",
+            ),
+            epochs=_positive_int(training_values.get("epochs", 1), "training.epochs"),
+            batch_size=_positive_int(
+                training_values.get("batch_size", 1), "training.batch_size"
+            ),
+            chunk_size_samples=_positive_int(
+                training_values.get("chunk_size_samples", 12000),
+                "training.chunk_size_samples",
+            ),
+            hidden_features=_positive_int(
+                training_values.get("hidden_features", 128),
+                "training.hidden_features",
+            ),
+            dropout=_bounded_float(
+                training_values.get("dropout", 0.0),
+                "training.dropout",
+                minimum=0.0,
+                maximum=1.0,
+                maximum_inclusive=False,
+            ),
+            learning_rate=_positive_float(
+                training_values.get("learning_rate", 1e-3),
+                "training.learning_rate",
+            ),
+            weight_decay=_non_negative_float(
+                training_values.get("weight_decay", 0.0),
+                "training.weight_decay",
+            ),
+            gradient_clip_norm=_positive_float(
+                training_values.get("gradient_clip_norm", 2.0),
+                "training.gradient_clip_norm",
+            ),
+            random_seed=_non_negative_int(
+                training_values.get("random_seed", 20260923),
+                "training.random_seed",
+            ),
+            num_workers=_non_negative_int(
+                training_values.get("num_workers", 0),
+                "training.num_workers",
+            ),
+            device=_required_device(training_values.get("device", "cuda:0")),
         ),
     )
 
@@ -213,3 +308,52 @@ def _non_negative_float(value: object, field_name: str) -> float:
     if converted < 0:
         raise ConfigError(f"{field_name} must be non-negative")
     return converted
+
+
+def _positive_float(value: object, field_name: str) -> float:
+    converted = _non_negative_float(value, field_name)
+    if converted == 0:
+        raise ConfigError(f"{field_name} must be greater than zero")
+    return converted
+
+
+def _bounded_float(
+    value: object,
+    field_name: str,
+    *,
+    minimum: float,
+    maximum: float,
+    maximum_inclusive: bool,
+) -> float:
+    converted = _non_negative_float(value, field_name)
+    above_maximum = converted > maximum if maximum_inclusive else converted >= maximum
+    if converted < minimum or above_maximum:
+        operator = "<=" if maximum_inclusive else "<"
+        raise ConfigError(
+            f"{field_name} must satisfy {minimum} <= value {operator} {maximum}"
+        )
+    return converted
+
+
+def _positive_int(value: object, field_name: str) -> int:
+    converted = _non_negative_int(value, field_name)
+    if converted == 0:
+        raise ConfigError(f"{field_name} must be greater than zero")
+    return converted
+
+
+def _non_negative_int(value: object, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be an integer")
+    if value < 0:
+        raise ConfigError(f"{field_name} must be non-negative")
+    return value
+
+
+def _required_device(value: object) -> str:
+    if value != "cuda:0":
+        raise ConfigError(
+            "training.device must be cuda:0 after selecting the physical GPU "
+            "with CUDA_VISIBLE_DEVICES"
+        )
+    return value
