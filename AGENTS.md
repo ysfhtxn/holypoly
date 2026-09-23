@@ -3,85 +3,141 @@
 ## 1. 项目概述
 
 * 项目名称：holypoly
-* 项目目标：从纳米孔测序数据中识别并估计 Poly 区域的长度。
-* Poly 类型：poly(A)和poly(T)的集合
+* 项目目标：从 Oxford Nanopore cDNA 原始信号中定位 Poly 区域，并估计其长度。
+* Poly 类型：poly(A) 与反向互补方向的 poly(T)。
 * 测序平台：Oxford Nanopore
 * 测序类型：cDNA
-* 当前阶段：数据整理
-* 项目流程：数据整理 -> 算法开发 -> 模型训练 -> 结果验证
+* 当前代码范围：外部数据诊断、训练 manifest、Bonito v5 辅助 head、冻结
+  encoder 训练和小规模 pipeline 验证。
+* 项目流程：数据整理 -> 标签审计 -> 算法开发 -> 模型训练 -> 独立验证。
+
+当前只支持 Bonito v5 Transformer。不要在没有明确任务的情况下扩展到旧版
+Bonito RNN、CTC 模型、多 GPU 或 distributed training。
 
 ### 1.1 科学问题
 
 本项目希望解决以下问题：
 
 1. 从原始电流信号中定位 Poly 区域。
-2. 估计 Poly 区域长度，单位为 nt或base。
-3. 将预测结果与已知构建长度、dorado等其他工具的结果结果比较。
-4. 分析不同样本、物种 对识别结果的影响。
+2. 估计 Poly 区域长度，单位为 nt 或 base。
+3. 将预测结果与已知构建长度、Dorado 等其他工具的结果比较。
+4. 分析不同样本、物种和测序批次对识别结果的影响。
 
-### 1.2 “长度”的定义
+### 1.2 标签与长度定义
 
-本项目中的 Poly 长度定义为：
+cDNA read 可能以两个方向出现，因此目标区域可能表现为 poly(A) 或其反向互补
+形式 poly(T)。以下字段不得混为一谈：
 
-cDNA read 可能以两个方向出现，因此目标区域可能表现为 poly(A)或其反向互补形式 poly(T)。
+* `nominal_length_nt`：构建设计或参考名称给出的标称长度。
+* `observed_sequence_length_nt`：Dorado 或其他 basecaller 在序列中观察到的长度。
+* `training_length_nt`：明确选择用于当前 loss 的训练目标。
+* read-level true length：经独立方法验证的单条 read 真实长度。
+* signal-level interval：原始 signal sample 上的 Poly 区间。
 
-需要特别说明：
+除非存在可靠的逐 read 证据，否则不得把标称构建长度或 basecaller 观察长度描述为
+read-level ground truth。弱监督标签必须记录 `label_source` 和限制。
 
-* 是否允许 Poly 区域中存在非目标碱基：这是最终目标，如有非目标碱基，也能准确识别
-* 允许的最大中断长度：最多允许2个非目标碱基
-* 最短有效 Poly 长度：0nt
-* 是否需要区分完整与截断的 Poly 区域：需要
+长期定义：
+
+* Poly 区域允许包含少量非目标碱基。
+* 目标最大连续中断长度为 2 个非目标碱基。
+* 最短有效 Poly 长度为 0 nt。
+* `0 nt` 是合法负标签，不等同于检测失败。
+* 必须区分完整、截断、无 Poly、无标签和检测失败。
+* Poly(A) 与 Poly(T) 使用一致的坐标和状态定义。
 
 ---
 
 ## 2. 输入与输出
 
-### 2.1 输入数据
+### 2.1 输入数据与路径
 
-项目可能使用以下数据：
+项目输入可能包括 POD5/FAST5、BAM/FASTQ、参考序列、move table、构建元数据和
+read-level manifest。
 
-| 数据类型            | 路径        | 用途        |
-| --------------- | --------- | --------- |
-| POD5/FAST5 原始信号 | /data/biolab-backup-hdd3/zhaoxy/holypoly_data/fixed_len_data/pod5 | 信号级长度识别   |
-| BAM/SAM         | /data/biolab-backup-hdd3/zhaoxy/holypoly_data/fixed_len_data/basecalls | 比对和方向判断   |
-| 参考序列            | /data/biolab-backup-hdd3/zhaoxy/holypoly_data/fixed_len_data/fixed_len_ref.fa | 定位目标序列    |
-| 真实长度标签          | /data/biolab-backup-hdd3/zhaoxy/holypoly_data/fixed_len_data/fixed_len_ref.fa的id | 训练和评估     |
+实际路径只能通过以下方式提供，优先级从高到低为：
 
-数据文件较大时，不要将真实数据提交到 Git。
+1. 命令行参数；
+2. 环境变量；
+3. `configs/local.yaml`；
+4. `configs/default.yaml`。
 
-参考序列中只有poly区域前的特异性序列，实际的read结构应该是 特异性序列-poly区域-统一的flank序列
+不得在源代码、单元测试或长期文档中写死机器绝对路径。常用环境变量包括：
 
-### 2.2 数据表格式
+```text
+HOLYPOLY_DATA_ROOT
+HOLYPOLY_WORK_ROOT
+HOLYPOLY_M3_MANIFEST
+HOLYPOLY_BONITO_MODEL
+HOLYPOLY_M3_CHECKPOINT
+```
 
-长度标签文件预计至少包含以下字段：
+后三个名称用于 integration test；测试代码不得为它们提供机器相关默认值。
 
-| 字段            | 含义           | 示例          |
-| ------------- | ------------ | ----------- |
-| read_id     | 纳米孔 read 标识符 | abc123    |
-| sample_id   | 样本标识符        | sample_01 |
-| true_length | 已知 Poly 长度   | 50        |
-| poly_type   | Poly 类型      | polyA     |
-| batch       | 测序批次         | run_01    |
+### 2.2 训练 Manifest
 
-实际字段定义：
+训练 manifest 使用 CSV 或 TSV，每行表示一个 read chunk。schema 的权威实现位于
+`src/holypoly/training_data.py`，至少包含：
+
+```text
+read_id
+pod5_path
+pod5_file_id
+split
+orientation
+raw_signal_length
+chunk_start_sample
+chunk_end_sample
+poly_start_sample
+poly_end_sample
+poly_type
+true_length_nt
+label_status
+poly_is_complete
+failure_reason
+manifest_version
+```
+
+可选审计字段包括：
+
+```text
+bam_path
+nominal_length_nt
+observed_sequence_length_nt
+label_source
+flank_source
+flank_status
+selection_reason
+```
+
+`true_length_nt` 是当前代码中的训练目标字段。创建 manifest 时必须同时记录其来源；
+不得仅根据字段名宣称其为逐 read ground truth。
+
+坐标统一采用原始 signal sample、0-based、左闭右开：
+
+```text
+[start_sample, end_sample)
+```
+
+raw sample 到 encoder timestep 的转换必须来自实际 Bonito 模型结构。当前支持的 v5
+模型实测 stride 为 6；不得对其他模型沿用该值。
 
 ### 2.3 输出结果
 
-主要输出文件为bam/fastq/fasta，以及一个csv/tsv
+长期目标输出包括逐 read TSV/CSV，以及保留原 basecall 内容的 BAM/FASTQ 注释。
+当前辅助 head 和训练代码不负责改写 basecalled sequence。
 
-bam/fastq/fasta除正常的数据外要将特定长度的polyA/T体现在序列中
+逐 read 结果至少应包含：
 
-csv/tsv至少包含：
-
-| 字段                 | 含义         |
-| ------------------ | ---------- |
-| read_id          | Read 标识符   |
-| predicted_length | 预测长度       |
-| start_position   | Poly 区域起点  |
-| end_position     | Poly 区域终点  |
-| confidence       | 预测置信度或质量分数 |
-| status           | 成功、失败或无法判断 |
-| failure_reason   | 失败原因       |
+| 字段 | 含义 |
+| --- | --- |
+| `read_id` | Read 标识符 |
+| `predicted_length_nt` | 预测长度，单位为 nt |
+| `start_sample` | Poly 区域 raw-sample 起点 |
+| `end_sample` | Poly 区域 raw-sample 终点 |
+| `confidence` | 预测置信度或质量分数 |
+| `status` | 成功、失败或无法判断 |
+| `failure_reason` | 失败原因 |
 
 如果某条 read 无法识别，不要静默删除；必须在结果中记录状态和原因。
 
@@ -89,7 +145,8 @@ csv/tsv至少包含：
 
 ## 3. 项目目录与外部数据
 
-本项目采用代码仓库与测序数据分离的结构。Git 仓库中不保存真实的 POD5、FAST5、FASTQ、BAM、参考序列、处理结果或模型权重。
+本项目采用代码仓库与测序数据分离的结构。Git 仓库中不保存真实的 POD5、FAST5、
+FASTQ、BAM、参考序列、处理结果或模型权重。
 
 ### 3.1 代码仓库结构
 
@@ -103,49 +160,42 @@ holypoly/
 │   ├── default.yaml
 │   └── local.example.yaml
 ├── src/
-│   ├── bonito/
+│   ├── bonito/                 # Git submodule 和独立运行环境
 │   └── holypoly/
 │       ├── __init__.py
-│       ├── preprocess.py
-│       ├── detect_poly.py
-│       ├── estimate_length.py
-│       └── evaluate.py
-├── scripts/
-├── tests/
-└── notebooks/
+│       ├── cli.py
+│       ├── config.py
+│       ├── doctor.py
+│       ├── poly_heads.py
+│       ├── model.py
+│       ├── losses.py
+│       ├── training_data.py
+│       └── training.py
+└── tests/
+    ├── test_config.py
+    ├── test_doctor.py
+    ├── test_poly_heads_subprocess.py
+    └── torch/
 ```
 
 目录用途：
 
 * `configs/`：保存配置模板和非机器相关的默认参数。
-* `src/holypoly/`：保存可复用的核心代码。
-* `scripts/`：保存数据整理、训练、预测和评估的命令行入口。
-* `tests/`：保存自动化测试。
-* `notebooks/`：仅用于探索性分析，不保存唯一版本的核心算法。
+* `src/holypoly/`：保存项目核心代码。
+* `src/bonito/`：上游 Bonito Git submodule，不直接修改。
+* `tests/`：父项目轻量测试。
+* `tests/torch/`：在 Bonito 独立环境中运行的 Torch、GPU 和 integration 测试。
 * 项目仓库中不创建用于保存真实测序数据的 `data/` 目录。
 * 项目仓库中不保存大型运行结果、缓存或模型权重。
+* Notebook 只能用于探索性分析，不得保存核心算法的唯一实现。
 
-### 3.2 外部数据目录
+### 3.2 外部数据和工作目录
 
-当前原始数据位于：
-
-```text
-/data/biolab-backup-hdd3/zhaoxy/holypoly_data/fixed_len_data/
-├── pod5/
-├── basecalls/
-└── fixed_len_ref.fa
-```
-
-路径含义：
-
-* `pod5/`：POD5 原始电流信号，只读。
-* `basecalls/`：已有的 FASTQ、SAM 或 BAM basecall 结果，只读。
-* `fixed_len_ref.fa`：固定 Poly 长度构建的参考序列，只读。
-
-建议为处理中间文件和结果单独设置外部工作目录：
+原始数据目录和工作目录必须分开：
 
 ```text
-/data/biolab-backup-hdd3/zhaoxy/holypoly_work/
+<data_root>/                  # 只读原始数据
+<work_root>/                  # 可写工作目录
 ├── processed/
 ├── metadata/
 ├── results/
@@ -154,96 +204,32 @@ holypoly/
 └── cache/
 ```
 
-目录用途：
-
-* `processed/`：预处理后的数据和中间文件。
-* `metadata/`：样本表、构建信息、manifest 和 read-level 标签。
-* `results/`：模型预测和评估结果。
-* `models/`：模型检查点和最终权重。
-* `logs/`：运行日志和实验记录。
-* `cache/`：允许重新生成的临时缓存。
-
-原始数据目录和工作目录必须分开。任何程序均不得修改、移动、重命名或覆盖原始数据。
-
-### 3.3 路径配置
-
-代码中不得写死服务器绝对路径。
-
-外部路径应通过以下方式传入，优先级从高到低为：
-
-1. 命令行参数；
-2. 环境变量；
-3. 本地配置文件；
-4. 默认配置。
-
-建议使用以下环境变量：
-
-```bash
-export HOLYPOLY_DATA_ROOT=/data/biolab-backup-hdd3/zhaoxy/holypoly_data/fixed_len_data
-export HOLYPOLY_WORK_ROOT=/data/biolab-backup-hdd3/zhaoxy/holypoly_work
-```
-
-路径含义：
-
-* `HOLYPOLY_DATA_ROOT`：只读原始数据根目录。
-* `HOLYPOLY_WORK_ROOT`：允许程序写入的工作目录。
-
-`configs/default.yaml` 只保存通用参数和相对路径，不保存特定服务器的绝对路径。
-
-机器相关的路径可以写入：
-
-```text
-configs/local.yaml
-```
-
-但 `configs/local.yaml` 必须加入 `.gitignore`，不得提交到 Git。仓库中只提交不包含真实路径的：
-
-```text
-configs/local.example.yaml
-```
-
-配置示例：
-
-```yaml
-paths:
-  data_root: "/path/to/read-only/data"
-  work_root: "/path/to/writable/work"
-
-  pod5_dir: "pod5"
-  basecalls_dir: "basecalls"
-  reference_path: "fixed_len_ref.fa"
-
-  processed_dir: "processed"
-  metadata_dir: "metadata"
-  results_dir: "results"
-  models_dir: "models"
-  logs_dir: "logs"
-  cache_dir: "cache"
-```
-
-相对路径的解释规则：
+相对路径解释规则：
 
 * `pod5_dir`、`basecalls_dir` 和 `reference_path` 相对于 `data_root`。
-* `processed_dir`、`metadata_dir`、`results_dir`、`models_dir`、`logs_dir` 和 `cache_dir` 相对于 `work_root`。
+* `processed_dir`、`metadata_dir`、`results_dir`、`models_dir`、`logs_dir` 和
+  `cache_dir` 相对于 `work_root`。
 
-### 3.4 数据访问规则
+### 3.3 数据访问规则
 
-Codex 修改代码时必须遵守：
+Codex 修改代码和运行命令时必须遵守：
 
 * 不得将真实 POD5、FAST5、FASTQ、BAM 或参考序列复制到项目仓库。
-* 不得修改原始数据目录中的任何文件。
+* 不得修改、移动、重命名或覆盖原始数据目录中的任何文件。
 * 所有生成文件只能写入 `HOLYPOLY_WORK_ROOT`。
 * 输出文件不得与输入文件使用相同路径。
-* 在执行写入操作前，必须检查目标路径不属于原始数据目录。
-* 不得在没有确认的情况下扫描或加载完整数据集。
-* 开发和测试时优先使用 read ID 清单或小型测试子集。
+* 写入前必须确认目标路径不属于原始数据目录。
+* 不得在没有确认的情况下扫描、索引或加载完整数据集。
+* 开发和测试时优先使用 read ID 清单、synthetic fixtures 或小型测试子集。
 * 大规模处理前必须报告预计读取的数据量、输出大小、运行时间和计算资源。
 * POD5 与 BAM/FASTQ 之间通过 `read_id` 建立关联。
 * 路径不存在或权限不足时，应明确报错，不得自动改用其他目录。
-* 单元测试不依赖服务器上的真实数据；优先使用程序生成的模拟数据。
-* 需要真实数据的测试应标记为 integration test，并在数据不可用时明确跳过。
+* 单元测试不得依赖服务器上的真实数据。
+* 真实数据测试必须标记为 `integration`，通过环境变量显式启用；数据、模型或
+  GPU 不可用时必须明确跳过或报错。
+* 真实 read ID、manifest、模型权重和 checkpoint 只能写入外部 work root。
 
-### 3.5 Git 忽略规则
+### 3.4 Git 忽略规则
 
 `.gitignore` 至少应包含：
 
@@ -268,68 +254,169 @@ logs/
 cache/
 ```
 
-允许提交的内容包括：
-
-* 不包含真实样本信息的配置模板；
-* 小型人工合成测试数据；
-* 数据格式说明；
-* manifest 字段定义；
-* 可复现的处理脚本；
-* 汇总统计和不包含敏感信息的小型图表。
+允许提交的内容包括不含真实样本信息的配置模板、程序生成的 synthetic fixtures、
+数据格式说明、manifest schema、可复现脚本和不含敏感信息的小型汇总结果。
 
 ---
 
-## 4. 分析流程
+## 4. 模型与训练接口
 
-当前计划处理流程为：
+### 4.1 Bonito 子模块
 
-1. 扫描 POD5/FAST5、BAM/FASTQ、参考序列和样本信息。
-2. 通过 `read_id` 检查 POD5 与已有 basecall 结果是否能够关联。
-3. 如果没有 basecall：
-   - 使用 Bonito 对 POD5/FAST5 进行 basecalling；
-   - 输出未比对 BAM；
-   - 尽可能保留 sequence-to-signal 对应信息。
-4. 使用 minimap2 将 basecalled sequence 比对到参考序列。
-5. 结合比对位置、引物位置和信号映射，生成 Poly 区域候选标签。
-6. 运行 Dorado poly(A/T) estimation，作为基线结果。
-7. 在 Bonito 基础上开发：
-   - `poly_location_head`：预测 Poly 区域边界；
-   - `poly_length_head`：预测 Poly 长度。
-8. 对低质量或无法估计的结果进行分类标记。
-9. 输出带注释的 BAM 和逐 read 的 TSV。
-10. 对 Holypoly、Dorado 和真实/标称长度进行比较。
+* `src/bonito` 是 Git submodule。
+* 不得直接修改 Bonito 源代码或其 site-packages。
+* Holypoly 的扩展必须位于 `src/holypoly/`。
+* 更新 Bonito 前必须记录旧、新 commit，并单独验证回归。
+* 完成工作前检查：
 
-最终形态流程说明：
+```bash
+git submodule status
+git -C src/bonito status --short
+```
 
-1. 读取POD5/FAST5/FASTQ/BAM
-2. 如有FASTQ/BAM，进入下一步，否则进行basecall
-3. 使用bonito为基础的深度学习模型定位、估计poly长度
-4. 对低质量或异常结果进行标记
-5. 输出每条 read 的预测结果和汇总报告，要有FASTQ/BAM和TSV/CSV两种格式。FASTQ/BAM中直接注明poly区域位置和长度。TSV/CSV做总结。
+### 4.2 模型接口契约
+
+`HolypolyModel` 必须：
+
+* 复用 Bonito v5 的共享 signal encoder。
+* 保留原 CRF/basecalling head。
+* 不改变原 basecalling 输出接口或解码逻辑。
+* 同一次 forward 共享计算 encoder features。
+* 同时返回 basecall、location 和 length 输出。
+* 默认冻结 encoder 和 basecalling head。
+* 默认只优化 `poly_location_head` 和 `poly_length_head`。
+
+实际 shape 必须从模型代码或运行结果确认，不得凭空假设。当前 v5 接口约定为：
+
+```text
+signal:                  [batch, 1, raw_samples]
+encoder_features:        [batch, time, channels]
+basecall_scores:         [time, batch, states]
+location_logits:         [batch, time, 3]
+location_status_logits:  [batch, 3]
+length_nt:               [batch]
+length_status_logits:    [batch, 3]
+```
+
+location 类别为 `background / poly(A) / poly(T)`；read 状态为
+`poly_present / zero_nt / failure`。padding mask 使用 PyTorch 约定，`True` 表示
+padding。
+
+### 4.3 辅助 Loss
+
+冻结 encoder 阶段的默认优化目标为：
+
+```text
+total_loss =
+    lambda_location * location_loss
+    + lambda_length * length_loss
+    + lambda_status * shared_status_loss
+```
+
+* basecalling loss 不加入当前辅助 head 优化目标。
+* `poly_present` 参与 location、length 和 status loss。
+* `zero_nt` 的 location 为 background，长度目标为 0 nt。
+* `failure` 的 location 使用 ignore index，length 不参与回归。
+* padding 区域不得参与 location loss。
+* NaN 或空长度目标不得进入普通回归 loss。
+* loss 权重必须由配置传入并分别记录。
+
+### 4.4 GPU 约束
+
+训练和 integration test 只使用一个显式选择的 GPU。通过 `CUDA_VISIBLE_DEVICES` 或
+配置选择物理设备，模型内部使用映射后的显式 `cuda:0`。不得在生产代码中写死物理
+设备编号，也不得实现多 GPU 或 distributed training，除非另有明确任务。
 
 ---
 
-## 5. 开发环境
+## 5. 开发环境与常用命令
 
-* 操作系统：Ubuntu 24.04.5 LTS
+* 操作系统：Ubuntu 24.04
 * Python 版本：Python 3.11
 * 环境管理：uv
-* GPU：Device 0 - NVIDIA GeForce RTX 3080 12G & Device 2 - NVIDIA GeForce RTX 3080 10G
-* Basecaller：bonito
-* 主要依赖：numpy、pandas、pysam、pod5、torch等
+* Basecaller：Bonito v5 Transformer
 
-- 依赖声明：`pyproject.toml`
-- 锁定文件：`uv.lock`
-- 安装环境：`uv sync --frozen`
-- 运行测试：`uv run pytest -q`
-- 检查格式：`uv run ruff format --check .`
-- 静态检查：`uv run ruff check .`
-- 类型检查：`uv run mypy src/holypoly`
-- GPU 设备必须通过配置文件或命令行指定，不得在代码中写死设备编号。
+### 5.1 依赖隔离
+
+父项目环境由根目录 `pyproject.toml` 和 `uv.lock` 管理：
+
+```bash
+uv sync --frozen
+```
+
+父项目不得安装 Torch、Bonito 或 POD5 训练依赖。相关依赖仅安装在：
+
+```text
+src/bonito/.venv
+```
+
+不得把 Bonito 环境依赖加入父项目以规避 subprocess 测试。如果 Bonito 环境缺失，
+应明确报告，不得静默安装到错误环境。
+
+### 5.2 常用检查
+
+```bash
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy src/holypoly
+uv run pytest -q
+```
+
+根目录 pytest 会通过 subprocess 调用 `src/bonito/.venv` 运行 `tests/torch/`，避免
+污染父项目依赖。
+
+需要直接运行 Torch 测试时：
+
+```bash
+PYTHONPATH=src \
+src/bonito/.venv/bin/python -m pytest -q tests/torch
+```
+
+真实数据 integration test 必须显式设置外部路径和 GPU，例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu-id> \
+HOLYPOLY_M3_MANIFEST=<external-manifest> \
+HOLYPOLY_BONITO_MODEL=<external-model-directory> \
+HOLYPOLY_M3_CHECKPOINT=<external-work-checkpoint> \
+PYTHONPATH=src \
+src/bonito/.venv/bin/python -m pytest -q tests/torch -m integration
+```
+
+不要把示例占位路径替换为机器路径后提交。
 
 ---
 
-## 6. 评价指标
+## 6. 测试要求
+
+### 6.1 必须覆盖的行为
+
+* manifest 正常、空文件、缺字段、重复 read/chunk 和非法状态。
+* raw-sample 到 encoder-timestep 的边界转换。
+* Poly(A)、Poly(T)、zero_nt、failure 和 padding。
+* 不同 batch size 和 signal length。
+* forward、有限 loss 和 backward。
+* 冻结参数无梯度、可训练参数有梯度。
+* state_dict/checkpoint 保存和恢复。
+* 固定随机种子下重复运行一致。
+* basecalling 输出接口回归。
+* 单元测试不依赖真实 POD5。
+* integration test 不修改外部 POD5/BAM。
+
+CPU 可用于确定性单元测试。训练循环、真实模型 backward 和真实数据 integration
+必须在明确指定的单 GPU 环境中运行。
+
+完整数据规模较大时，默认只运行 synthetic 和小型测试。运行完整流程或长时间训练前，
+必须先说明预计时间、读取量、输出大小和计算资源。
+
+### 6.2 测试结果报告
+
+如果命令不存在、环境缺失、GPU 不可用或测试被跳过，必须报告实际原因，不得伪造
+通过结果。integration smoke test 只证明数据链路可以运行，不得解释为泛化能力。
+
+---
+
+## 7. 评价指标
 
 优先使用以下指标：
 
@@ -337,116 +424,87 @@ cache/
 * Median AE：绝对误差的中位数。
 * RMSE：对较大误差更敏感。
 * Bias：平均预测偏差，用于判断系统性高估或低估。
-* Within-tolerance accuracy：误差在 10nt 5nt 1nt 内的比例。
-* 相关性：Pearson、Spearman二者。
+* Within-tolerance accuracy：分别报告误差在 1 nt、5 nt 和 10 nt 内的比例。
+* 相关性：Pearson 和 Spearman。
 * 无法识别率：无法输出有效长度的 read 比例。
 
-主要评价指标：Within-tolerance accuracy和MAE
+主要评价指标为 Within-tolerance accuracy 和 MAE。需要分别报告：
 
-需要分别报告：
+* 不同真实长度区间的结果。
+* 不同 read 质量区间的结果。
+* 成功识别与识别失败的数量。
 
-* 不同真实长度区间的结果；
-* 不同 read 质量区间的结果；
-* 成功识别与识别失败的数量；
+只有在存在可靠 read-level 标签时，才允许将这些指标描述为正式准确率。使用构建级
+弱监督或 provisional 边界的 smoke test 不得报告正式 MAE、泛化能力或最终准确率。
 
-训练集、验证集和测试集可以按照pod5文件 进行划分，避免数据泄漏。
+训练集、验证集和测试集必须按 POD5 文件、run 或其他独立采集单元划分，不得仅随机
+拆分 read，从而避免数据泄漏。
 
 ---
 
-## 7. 编码要求
+## 8. 编码要求
 
-Codex 修改代码时应遵守以下规则：
+Codex 修改代码时应遵守：
 
-* 在修改前先阅读相关代码、配置文件和测试。
+* 修改前先阅读相关代码、配置文件和测试。
 * 优先进行小范围、可验证的修改。
-* 不要修改或覆盖原始数据。
-* 不要在代码中写死数据绝对路径。
-* 路径、阈值和模型参数应放入配置文件或命令行参数。
+* 不修改或覆盖原始数据。
+* 不在代码或测试中写死数据绝对路径。
+* 路径、阈值和模型参数应放入配置文件、manifest、环境变量或命令行参数。
 * 新增函数应包含清晰的 docstring。
-* 对关键数组说明维度、单位和数据类型。
+* 对关键数组说明 shape、坐标单位、坐标系统和 dtype。
 * 固定随机种子，并记录会影响结果的随机过程。
 * 不要仅在 Notebook 中实现核心算法。
-* 新增依赖前说明用途，并更新 uv的环境文件。
+* 新增依赖前说明用途，并更新对应环境的依赖文件。
 * 修改算法后必须增加或更新测试。
 * 不确定生物学定义或数据含义时，先提出问题，不要自行假设。
+* 不得把标称长度、Dorado 观察值和真实逐 read 标签互相替代。
+* 不得为通过测试而修改 Bonito 原输出、放宽标签定义或读取完整数据集。
+* 生成文件必须写入 work root，并在写入前确认目标不位于 data root。
 
 代码风格：
 
-* 格式化工具：`ruff format`
-* 静态检查：`ruff check`；核心模块额外使用 `mypy`
-* 最大行宽：`88`
-* 命名规则：
-  * Python 文件和模块使用 `snake_case`，例如 `estimate_poly_length.py`
-  * 函数和变量使用 `snake_case`，例如 `detect_poly_region`
-  * 类使用 `PascalCase`，例如 `PolyLengthEstimator`
-  * 常量使用 `UPPER_SNAKE_CASE`，例如 `MIN_POLY_LENGTH`
-  * 内部使用的函数以单下划线开头，例如 `_normalize_signal`
-  * 包含单位的数值应在名称中注明单位，例如 `poly_length_nt`、
-    `duration_ms`、`current_pa`
-  * 除循环索引外，避免使用含义不清的单字母变量
+* 格式化工具：`ruff format`。
+* 静态检查：`ruff check`；核心模块额外使用 `mypy`。
+* 最大行宽：88。
+* Python 文件、模块、函数和变量使用 `snake_case`。
+* 类使用 `PascalCase`。
+* 常量使用 `UPPER_SNAKE_CASE`。
+* 内部函数以单下划线开头。
+* 包含单位的数值应在名称中注明单位，例如 `poly_length_nt`、
+  `duration_ms`、`current_pa`。
+* 除循环索引外，避免使用含义不清的单字母变量。
 
 ---
 
-## 8. 测试要求
+## 9. 长期开发边界
 
-至少覆盖以下情况：
+除非用户明确要求，不要：
 
-1. 已知长度的正常 Poly 区域。
-2. 非常短和非常长的 Poly 区域。
-3. Poly 区域中存在少量非目标碱基。
-4. 输入信号或序列不完整。
-5. 找不到 Poly 区域。
-6. 输入文件为空或格式错误。
-7. 重复运行获得一致结果。
+* 修改 Bonito 子模块、原 CRF/CTC head 或解码逻辑。
+* 改变原 basecalling 输出格式。
+* 将 basecalling loss 自动加入冻结 encoder 的辅助 head 训练。
+* 实现多 GPU、distributed training 或完整数据训练。
+* 自动选择 label truth、flank 或坐标定义。
+* 根据模型预测改写原始 POD5、BAM、FASTQ 或参考序列。
+* 把 smoke-test 指标解释为正式泛化性能。
 
-用于快速测试的小型数据位于：
-
-目前没有小型数据，可以从现有数据中切一部分
-
-完整数据规模较大时，Codex 默认只运行小型测试；运行完整流程前应先说明预计的时间和资源需求。
-
----
-
-## 9. 当前任务
-
-## 9. 当前任务
-
-当前阶段仅完成数据整理和基线建立：
-
-1. 扫描现有 POD5、BAM 和参考序列。
-2. 生成样本、构建和文件级 manifest。
-3. 检查 POD5 与 BAM 的 `read_id` 匹配情况。
-4. 提取每条 read 的基础元数据。
-5. 创建 100～1000 条 read 的小型测试数据集。
-6. 运行 Dorado poly(A/T) estimation，生成基线结果。
-7. 明确模型训练所需的 signal-level 和 sequence-level 标签格式。
-
-本阶段不包含：
-
-- 训练最终深度学习模型；
-- 修改 Bonito 网络结构；
-- 在野生型数据上进行正式评估；
-- 根据预测结果修改原始 basecall 序列。
-
-完成标准：
-
-* [ ] 功能已经实现。
-* [ ] 不破坏现有接口。
-* [ ] 对正常输入和异常输入都有测试。
-* [ ] 已运行 测试命令。
-* [ ] 输出结果包含必要字段。
-* [ ] 更新相关文档或使用示例。
+如任务需要重新定义标签、坐标系统、Poly 中断规则或 loss 目标，必须暂停并向用户
+确认。
 
 ---
 
 ## 10. 已知问题与限制
 
-* 短 Poly 区域容易与背景信号混淆
-* 部分 read 的测序方向未知
-* 真实长度标签并不一定对应read真实的poly长度
-* 目前工具对0nt poly识别效果差
+* 短 Poly 区域容易与背景信号混淆。
+* 部分 read 的方向、完整性和 Poly 边界不确定。
+* 构建标称长度不一定等于单条 read 的真实 Poly 长度。
+* Dorado/basecaller 观察长度包含 basecalling 误差。
+* provisional flank 或弱监督边界不能直接作为最终 ground truth。
+* `0 nt` 必须与 failure、无标签和漏检分别处理。
+* 跨 chunk Poly 区域及 chunk 拼接仍需独立验证。
 
-对于这些问题，Codex 可以提出解决方案，但在未经确认前不要大规模修改分析流程。
+对于这些问题，可以提出解决方案，但在未经确认前不要大规模修改分析流程。
 
 ---
 
@@ -454,17 +512,24 @@ Codex 修改代码时应遵守以下规则：
 
 每次实验应记录：
 
-* Git commit ID；
-* 配置文件；
-* 输入数据版本；
-* 软件和依赖版本；
-* 随机种子；
-* 运行命令；
-* 开始与结束时间；
-* 输出目录；
-* 主要评价指标。
+* Git commit ID。
+* Bonito submodule commit。
+* 配置文件和运行命令。
+* 输入数据与 manifest 版本。
+* Bonito model config 和模型来源。
+* 标签来源和坐标系统。
+* manifest schema version。
+* loss 配置和权重。
+* 随机种子。
+* Python、PyTorch、CUDA 和 GPU 版本。
+* 开始与结束时间。
+* 输出目录。
+* 主要指标及其是否仅为 smoke-test 数值。
 
-实验记录位置：灵活安排，符合项目目录结构
+checkpoint 应至少保存 model state、optimizer state、epoch、global step、random seed、
+版本信息、manifest schema 和 loss 配置。
+
+实验记录和 checkpoint 只能写入外部 work root，不得提交到 Git。
 
 ---
 
@@ -472,10 +537,12 @@ Codex 修改代码时应遵守以下规则：
 
 完成任务后，请说明：
 
-1. 修改了哪些文件；
-2. 实现了什么功能；
-3. 做了哪些假设；
-4. 运行了哪些测试；
-5. 测试是否通过；
-6. 尚未解决的问题；
+1. 修改了哪些文件。
+2. 实现了什么功能。
+3. 做了哪些假设。
+4. 运行了哪些测试。
+5. 测试是否通过。
+6. 尚未解决的问题。
 7. 建议的下一步工作。
+8. 是否读取或写入了外部数据。
+9. GPU、模型和 manifest 是否参与测试。
