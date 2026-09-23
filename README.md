@@ -99,3 +99,37 @@ uv run pytest -q
 
 父项目 pytest 会通过 subprocess 在 `src/bonito/.venv` 中执行 Torch 测试，避免将
 Torch 和 Bonito 依赖安装到 holypoly 的 `.venv`。
+
+## 辅助 head 训练数据接口
+
+`src/holypoly/training_data.py` 提供只读 manifest、固定长度 Dataset 和 collate。
+manifest 使用 CSV 或 TSV，每行对应一个 read chunk，必需字段为：
+
+```text
+read_id, pod5_path, pod5_file_id, split, orientation,
+raw_signal_length, chunk_start_sample, chunk_end_sample,
+poly_start_sample, poly_end_sample, poly_type, true_length_nt,
+label_status, poly_is_complete, failure_reason
+```
+
+所有 signal 和 Poly 坐标均使用原始 signal sample、0-based、左闭右开。训练 chunk
+必须完全包含 `poly_present` 区域、长度固定且能被 12 整除，从而使 Bonito v5 的
+卷积和上采样输出严格对应 `chunk_size / 6` 个 encoder timestep。`zero_nt` 使用全
+background location 标签和 0 nt 长度；`failure` 使用 `-100` location 标签、空长度
+和明确的 `failure_reason`。
+
+Dataset 只读取 manifest 指定的 POD5 read，并由调用方提供 Bonito 模型配置中的
+signal shift/scale。它不裁剪、修改或写入 POD5。Torch 相关测试继续在 Bonito 的
+独立环境中运行。
+
+## Milestone 3 冻结 encoder 训练
+
+`HolypolyModel` 位于 `src/holypoly/model.py`，默认冻结 Bonito v5 的 convolution、
+Transformer、upsample 和原 CRF head，仅让 location/length 两个 Poly head 参与
+优化。`src/holypoly/losses.py` 提供独立的 masked auxiliary loss，
+`src/holypoly/training.py` 提供单 GPU epoch、验证、指标、日志和 checkpoint 恢复。
+
+真实 smoke manifest 必须放在外部 work root，并分别记录构建标称长度、Dorado
+观察长度和实际训练目标。当前 2p5per smoke 使用构建级 20 nt 弱监督与 provisional
+flank，只验证 POD5→Dataset→model→loss→backward→checkpoint 链路，不用于报告
+正式 MAE 或泛化能力。

@@ -21,7 +21,7 @@ def test_poly_heads_in_isolated_bonito_environment() -> None:
             "-m",
             "pytest",
             "-q",
-            "tests/torch/test_poly_heads.py",
+            "tests/torch",
         ],
         cwd=project_root,
         env=environment,

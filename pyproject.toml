@@ -38,7 +38,7 @@ files = ["src/holypoly"]
 exclude = ["^src/bonito/"]
 
 [[tool.mypy.overrides]]
-module = ["torch", "torch.*"]
+module = ["bonito", "bonito.*", "pod5", "pod5.*", "torch", "torch.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -46,6 +46,21 @@ module = "holypoly.poly_heads"
 disallow_subclassing_any = false
 warn_return_any = false
 
+[[tool.mypy.overrides]]
+module = [
+    "holypoly.losses",
+    "holypoly.model",
+    "holypoly.training_data",
+]
+disallow_subclassing_any = false
+
+[[tool.mypy.overrides]]
+module = "holypoly.model"
+warn_return_any = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["tests/torch"]
+markers = [
+    "integration: requires explicitly configured external data and model paths",
+]
