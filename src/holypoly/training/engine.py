@@ -13,11 +13,12 @@ from typing import Any
 
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
-from holypoly.losses import PolyAuxiliaryLoss, PolyLossWeights
-from holypoly.model import HolypolyModel
-from holypoly.poly_heads import PolyClass, ReadStatus
-from holypoly.training_data import PolyTrainingBatch
+from holypoly.models.model import HolypolyModel
+from holypoly.models.poly_heads import PolyClass, ReadStatus
+from holypoly.training.data import PolyTrainingBatch
+from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
 
 
 @dataclass(frozen=True)
@@ -120,30 +121,44 @@ def train_one_epoch(
     device: torch.device,
     gradient_clip_norm: float,
     global_step: int = 0,
+    progress_desc: str | None = None,
 ) -> EpochResult:
-    """Train both Poly heads for one epoch on one explicit GPU."""
+    """Train both Poly heads, optionally showing batch progress on stderr."""
     require_single_cuda_device(device)
     if gradient_clip_norm <= 0:
         raise ValueError("gradient_clip_norm must be greater than zero")
     model.train()
     accumulator = _MetricAccumulator()
-    for batch in batches:
-        device_batch = _batch_to_device(batch, device)
-        optimizer.zero_grad(set_to_none=True)
-        output = model(device_batch.signal, device_batch.raw_padding_mask)
-        losses = criterion(
-            output,
-            device_batch.location_targets,
-            device_batch.true_length_nt,
-            device_batch.status_targets,
-        )
-        losses["total_loss"].backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(model.trainable_parameters()), gradient_clip_norm
-        )
-        optimizer.step()
-        global_step += 1
-        accumulator.update(output, device_batch, losses)
+    with tqdm(
+        batches,
+        desc=progress_desc,
+        disable=progress_desc is None,
+        unit="batch",
+        dynamic_ncols=True,
+        mininterval=1.0,
+        file=sys.stderr,
+    ) as progress:
+        for batch in progress:
+            device_batch = _batch_to_device(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            output = model(device_batch.signal, device_batch.raw_padding_mask)
+            losses = criterion(
+                output,
+                device_batch.location_targets,
+                device_batch.true_length_nt,
+                device_batch.status_targets,
+            )
+            losses["total_loss"].backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.trainable_parameters()), gradient_clip_norm
+            )
+            optimizer.step()
+            global_step += 1
+            accumulator.update(output, device_batch, losses)
+            if progress_desc is not None:
+                progress.set_postfix(
+                    loss=f"{losses['total_loss'].detach().item():.4f}", refresh=False
+                )
     return accumulator.result(global_step)
 
 
@@ -154,13 +169,25 @@ def validate_one_epoch(
     *,
     device: torch.device,
     global_step: int,
+    progress_desc: str | None = None,
 ) -> EpochResult:
-    """Evaluate frozen-encoder auxiliary heads without gradients."""
+    """Evaluate without gradients, optionally showing batch progress on stderr."""
     require_single_cuda_device(device)
     model.eval()
     accumulator = _MetricAccumulator()
-    with torch.no_grad():
-        for batch in batches:
+    with (
+        torch.no_grad(),
+        tqdm(
+            batches,
+            desc=progress_desc,
+            disable=progress_desc is None,
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            file=sys.stderr,
+        ) as progress,
+    ):
+        for batch in progress:
             device_batch = _batch_to_device(batch, device)
             output = model(device_batch.signal, device_batch.raw_padding_mask)
             losses = criterion(
@@ -170,6 +197,10 @@ def validate_one_epoch(
                 device_batch.status_targets,
             )
             accumulator.update(output, device_batch, losses)
+            if progress_desc is not None:
+                progress.set_postfix(
+                    loss=f"{losses['total_loss'].detach().item():.4f}", refresh=False
+                )
     return accumulator.result(global_step)
 
 
@@ -264,6 +295,7 @@ class _MetricAccumulator:
         self.length_absolute_error = 0.0
         self.length_examples = 0
         self.status_correct = 0
+        self.status_examples = 0
 
     def update(
         self,
@@ -316,9 +348,11 @@ class _MetricAccumulator:
         shared_status = (
             output.location.status_logits + output.length.status_logits
         ) / 2
+        valid_status = batch.status_targets != -100
+        self.status_examples += int(valid_status.sum().item())
         self.status_correct += int(
             torch.count_nonzero(
-                shared_status.argmax(dim=-1) == batch.status_targets
+                valid_status & (shared_status.argmax(dim=-1) == batch.status_targets)
             ).item()
         )
 
@@ -360,7 +394,11 @@ class _MetricAccumulator:
                 if self.length_examples == 0
                 else self.length_absolute_error / self.length_examples
             ),
-            status_accuracy=self.status_correct / self.examples,
+            status_accuracy=(
+                float("nan")
+                if self.status_examples == 0
+                else self.status_correct / self.status_examples
+            ),
         )
 
 

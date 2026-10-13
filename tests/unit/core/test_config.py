@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from holypoly.config import ConfigError, load_config
+from holypoly.core.config import ConfigError, load_config
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _write_default(path: Path, data_root: Path, work_root: Path) -> None:
@@ -25,6 +27,19 @@ doctor:
 """.strip(),
         encoding="utf-8",
     )
+
+
+def test_repository_defaults_do_not_embed_machine_paths() -> None:
+    config = load_config(
+        default_path=REPOSITORY_ROOT / "configs" / "default.yaml",
+        environ={},
+    )
+
+    assert config.paths.data_root is None
+    assert config.paths.work_root is None
+    assert config.training.manifest_path is None
+    assert config.training.bonito_model is None
+    assert config.training.checkpoint_path is None
 
 
 def test_path_precedence(tmp_path: Path) -> None:

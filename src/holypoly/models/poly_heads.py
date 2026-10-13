@@ -13,6 +13,14 @@ from torch import Tensor, nn
 BONITO_V5_STRIDE = 6
 
 
+def masked_status_loss(logits: Tensor, targets: Tensor) -> Tensor:
+    """Ignore -100 status targets, including batches with no status labels."""
+    valid = targets != -100
+    if torch.any(valid):
+        return functional.cross_entropy(logits[valid], targets[valid])
+    return logits.sum() * 0.0
+
+
 class PolyClass(IntEnum):
     """Per-timestep labels produced by :class:`PolyLocationHead`."""
 
@@ -213,7 +221,7 @@ class PolyLocationHead(_FeatureHead):
             )
         else:
             location_loss = output.location_logits.sum() * 0.0
-        status_loss = functional.cross_entropy(output.status_logits, status_targets)
+        status_loss = masked_status_loss(output.status_logits, status_targets)
         total_loss = location_loss + status_weight * status_loss
         return {
             "total_loss": total_loss,
@@ -312,7 +320,7 @@ class PolyLengthHead(_FeatureHead):
             )
         else:
             length_loss = output.length_nt.sum() * 0.0
-        status_loss = functional.cross_entropy(output.status_logits, status_targets)
+        status_loss = masked_status_loss(output.status_logits, status_targets)
         total_loss = length_loss + status_weight * status_loss
         return {
             "total_loss": total_loss,
@@ -528,7 +536,7 @@ class BonitoV5MultiTaskModel(nn.Module):
         shared_status_logits = (
             output.location.status_logits + output.length.status_logits
         ) / 2
-        status_loss = functional.cross_entropy(shared_status_logits, status_targets)
+        status_loss = masked_status_loss(shared_status_logits, status_targets)
         total_loss = (
             self.lambda_location * location_losses["location_loss"]
             + self.lambda_length * length_losses["length_loss"]

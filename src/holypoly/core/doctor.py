@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from holypoly.config import AppConfig
+from holypoly.core.config import AppConfig
 
 
 class CheckStatus(StrEnum):

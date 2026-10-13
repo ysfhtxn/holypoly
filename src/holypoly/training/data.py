@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from holypoly.poly_heads import (
+from holypoly.models.poly_heads import (
     BONITO_V5_STRIDE,
     PolyClass,
     ReadStatus,
@@ -49,6 +49,13 @@ class ManifestLabelStatus(StrEnum):
     FAILURE = "failure"
 
 
+class ManifestSupervisionMode(StrEnum):
+    """Length-only weak labels do not supervise location or read status."""
+
+    FULL = "full"
+    LENGTH_ONLY = "length_only"
+
+
 @dataclass(frozen=True)
 class PolyTrainingRecord:
     """Validated manifest row using absolute raw-signal sample coordinates."""
@@ -76,16 +83,25 @@ class PolyTrainingRecord:
     flank_source: str = "not_applicable"
     flank_status: str = "not_applicable"
     selection_reason: str = "synthetic_fixture"
+    supervision_mode: ManifestSupervisionMode = ManifestSupervisionMode.FULL
+    model_input_samples: int | None = None
+    head_excluded: bool = False
+    head_boundary_sample: int | None = None
 
     @property
     def chunk_length_samples(self) -> int:
-        """Return the fixed input chunk length in raw samples."""
+        """Return the real retained interval length in raw samples, before padding."""
         return self.chunk_end_sample - self.chunk_start_sample
 
     @property
     def training_length_nt(self) -> float:
         """Return the explicit length target used by the training loss."""
         return self.true_length_nt
+
+    @property
+    def input_length_samples(self) -> int:
+        """Return padded model input size; legacy rows use their full chunk size."""
+        return self.model_input_samples or self.chunk_length_samples
 
 
 @dataclass(frozen=True)
@@ -162,7 +178,7 @@ class Pod5SignalReader:
 
 
 class PolyTrainingDataset(Dataset[PolyTrainingExample]):
-    """Load fixed-size signal chunks named by validated manifest records."""
+    """Load real raw intervals, optionally right-padding to fixed model inputs."""
 
     def __init__(
         self,
@@ -178,7 +194,7 @@ class PolyTrainingDataset(Dataset[PolyTrainingExample]):
         if not selected:
             raise ValueError("training dataset must contain at least one record")
 
-        inferred_chunk_size = selected[0].chunk_length_samples
+        inferred_chunk_size = selected[0].input_length_samples
         expected_chunk_size = (
             inferred_chunk_size if chunk_size_samples is None else chunk_size_samples
         )
@@ -192,10 +208,14 @@ class PolyTrainingDataset(Dataset[PolyTrainingExample]):
                 f"{BONITO_V5_INPUT_ALIGNMENT} for exact Bonito v5 alignment"
             )
         for record in selected:
-            if record.chunk_length_samples != expected_chunk_size:
+            if (
+                record.input_length_samples != expected_chunk_size
+                or not 0 < record.chunk_length_samples <= expected_chunk_size
+            ):
                 raise ValueError(
                     "all manifest chunks must have the same length; "
-                    f"read {record.read_id!r} has {record.chunk_length_samples}, "
+                    f"read {record.read_id!r} has input size "
+                    f"{record.input_length_samples}, "
                     f"expected {expected_chunk_size}"
                 )
 
@@ -229,13 +249,16 @@ class PolyTrainingDataset(Dataset[PolyTrainingExample]):
         signal = full_signal[record.chunk_start_sample : record.chunk_end_sample].to(
             dtype=torch.float32
         )
-        if signal.shape != (self.chunk_size_samples,):
+        if signal.shape != (record.chunk_length_samples,):
             raise ValueError(
                 f"chunk for read {record.read_id!r} has shape "
-                f"{tuple(signal.shape)}, expected {(self.chunk_size_samples,)}"
+                f"{tuple(signal.shape)}, expected {(record.chunk_length_samples,)}"
             )
         if not torch.all(torch.isfinite(signal)):
             raise ValueError(f"signal for read {record.read_id!r} contains NaN or Inf")
+        signal = torch.nn.functional.pad(
+            signal, (0, self.chunk_size_samples - signal.shape[0]), value=0.0
+        )
         return PolyTrainingExample(signal=signal.contiguous(), record=record)
 
 
@@ -279,7 +302,7 @@ def load_training_manifest(path: Path) -> tuple[PolyTrainingRecord, ...]:
 def collate_poly_training_examples(
     examples: Sequence[PolyTrainingExample],
 ) -> PolyTrainingBatch:
-    """Collate fixed v5-aligned chunks and create encoder-timestep labels."""
+    """Collate fixed inputs with suffix padding and raw-coordinate Poly labels."""
     if not examples:
         raise ValueError("cannot collate an empty training batch")
     chunk_size_samples = examples[0].signal.shape[0]
@@ -292,6 +315,12 @@ def collate_poly_training_examples(
         raise ValueError("all signal chunks in a batch must have the same shape")
 
     feature_steps = chunk_size_samples // BONITO_V5_STRIDE
+    raw_lengths = torch.tensor(
+        [example.record.chunk_length_samples for example in examples], dtype=torch.long
+    )
+    if torch.any(raw_lengths <= 0) or torch.any(raw_lengths > chunk_size_samples):
+        raise ValueError("real chunk lengths must fit inside the padded inputs")
+    padding_mask = torch.arange(chunk_size_samples)[None, :] >= raw_lengths[:, None]
     location_targets = torch.stack(
         [
             _location_targets_for_record(
@@ -301,16 +330,18 @@ def collate_poly_training_examples(
             for example in examples
         ]
     )
+    feature_lengths = torch.div(
+        raw_lengths + BONITO_V5_STRIDE - 1, BONITO_V5_STRIDE, rounding_mode="floor"
+    )
+    location_targets.masked_fill_(
+        torch.arange(feature_steps)[None, :] >= feature_lengths[:, None],
+        LOCATION_IGNORE_INDEX,
+    )
     signal = torch.stack([example.signal for example in examples]).unsqueeze(1)
-    batch_size = len(examples)
     return PolyTrainingBatch(
         signal=signal,
-        raw_padding_mask=torch.zeros(
-            (batch_size, chunk_size_samples), dtype=torch.bool
-        ),
-        raw_lengths_samples=torch.full(
-            (batch_size,), chunk_size_samples, dtype=torch.long
-        ),
+        raw_padding_mask=padding_mask,
+        raw_lengths_samples=raw_lengths,
         location_targets=location_targets,
         true_length_nt=torch.tensor(
             [example.record.true_length_nt for example in examples],
@@ -327,7 +358,10 @@ def collate_poly_training_examples(
 def _location_targets_for_record(
     record: PolyTrainingRecord, *, feature_steps: int
 ) -> Tensor:
-    if record.label_status is ManifestLabelStatus.FAILURE:
+    if (
+        record.label_status is ManifestLabelStatus.FAILURE
+        or record.supervision_mode is ManifestSupervisionMode.LENGTH_ONLY
+    ):
         return torch.full((feature_steps,), LOCATION_IGNORE_INDEX, dtype=torch.long)
     if record.label_status is ManifestLabelStatus.ZERO_NT:
         return torch.full((feature_steps,), int(PolyClass.BACKGROUND), dtype=torch.long)
@@ -351,6 +385,8 @@ def _location_targets_for_record(
 
 
 def _read_status(record: PolyTrainingRecord) -> int:
+    if record.supervision_mode is ManifestSupervisionMode.LENGTH_ONLY:
+        return LOCATION_IGNORE_INDEX
     return {
         ManifestLabelStatus.POLY_PRESENT: int(ReadStatus.POLY_PRESENT),
         ManifestLabelStatus.ZERO_NT: int(ReadStatus.ZERO_NT),
@@ -399,6 +435,12 @@ def _parse_manifest_row(
             flank_source=_required_text(row, "flank_source", context),
             flank_status=_required_text(row, "flank_status", context),
             selection_reason=_required_text(row, "selection_reason", context),
+            supervision_mode=ManifestSupervisionMode(
+                row.get("supervision_mode") or "full"
+            ),
+            model_input_samples=_optional_int(row, "model_input_samples", context),
+            head_excluded=_optional_bool(row, "head_excluded", context) is True,
+            head_boundary_sample=_optional_int(row, "head_boundary_sample", context),
         )
     except ValueError as error:
         raise ValueError(
@@ -422,9 +464,61 @@ def _validate_record(record: PolyTrainingRecord, context: str) -> None:
             "raw_signal_length"
         )
 
+    if record.model_input_samples is not None and (
+        record.model_input_samples < BONITO_V5_INPUT_ALIGNMENT
+        or record.model_input_samples % BONITO_V5_INPUT_ALIGNMENT != 0
+        or record.chunk_length_samples > record.model_input_samples
+    ):
+        raise ValueError(f"{context}: invalid model_input_samples for real chunk")
+    if (
+        record.manifest_version == "construct-nominal-head-excluded-v3"
+        and not record.head_excluded
+    ):
+        raise ValueError(f"{context}: v3 requires head_excluded=true")
+    if record.head_excluded:
+        boundary = record.head_boundary_sample
+        if (
+            record.model_input_samples is None
+            or boundary is None
+            or not 0 <= boundary <= record.raw_signal_length
+            or record.orientation not in {"forward", "reverse"}
+        ):
+            raise ValueError(
+                f"{context}: head exclusion requires a boundary and input size"
+            )
+        if (
+            record.orientation == "forward"
+            and record.chunk_start_sample < boundary
+            or record.orientation == "reverse"
+            and record.chunk_end_sample > boundary
+        ):
+            raise ValueError(f"{context}: chunk includes signal on the head side")
+
     if record.label_status is ManifestLabelStatus.POLY_PRESENT:
         if record.poly_type is ManifestPolyType.NONE:
             raise ValueError(f"{context}: poly_present requires polyA or polyT")
+        if record.supervision_mode is ManifestSupervisionMode.LENGTH_ONLY:
+            if (
+                record.poly_start_sample is not None
+                or record.poly_end_sample is not None
+                or record.poly_is_complete is not None
+                or not math.isnan(record.observed_sequence_length_nt)
+            ):
+                raise ValueError(
+                    f"{context}: length_only must leave Poly bounds, completeness "
+                    "and observed_sequence_length_nt unknown"
+                )
+            if (
+                record.label_source != "construct_nominal_weak_supervision"
+                or not math.isfinite(record.true_length_nt)
+                or record.true_length_nt <= 0
+                or record.true_length_nt != record.nominal_length_nt
+                or record.failure_reason
+            ):
+                raise ValueError(
+                    f"{context}: length_only requires a positive nominal weak target"
+                )
+            return
         if record.poly_start_sample is None or record.poly_end_sample is None:
             raise ValueError(f"{context}: poly_present requires a Poly interval")
         if not (
@@ -445,9 +539,9 @@ def _validate_record(record: PolyTrainingRecord, context: str) -> None:
             raise ValueError(
                 f"{context}: poly_present requires a positive finite true_length_nt"
             )
-        if not math.isfinite(record.nominal_length_nt) or record.nominal_length_nt <= 0:
+        if not math.isfinite(record.nominal_length_nt) or record.nominal_length_nt < 0:
             raise ValueError(
-                f"{context}: poly_present requires a positive nominal_length_nt"
+                f"{context}: poly_present requires a non-negative nominal_length_nt"
             )
         if (
             not math.isfinite(record.observed_sequence_length_nt)
@@ -461,6 +555,8 @@ def _validate_record(record: PolyTrainingRecord, context: str) -> None:
             raise ValueError(f"{context}: poly_present must not define failure_reason")
         return
 
+    if record.supervision_mode is ManifestSupervisionMode.LENGTH_ONLY:
+        raise ValueError(f"{context}: length_only requires a positive construct")
     if record.poly_type is not ManifestPolyType.NONE:
         raise ValueError(f"{context}: non-present records require poly_type=none")
     if record.poly_start_sample is not None or record.poly_end_sample is not None:

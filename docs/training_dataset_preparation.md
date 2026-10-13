@@ -214,7 +214,7 @@ alignment_orientation
 nominal_length_nt
 ```
 
-现有 `src/holypoly/length_groups.py` 可以从 BAM 比对参考名称解析标称长度，并按
+现有 `src/holypoly/datasets/length_groups.py` 可以从 BAM 比对参考名称解析标称长度，并按
 `nominal_length_nt` 整理 read。该结果只表示构建级分类，还不能直接训练 location
 head。
 
@@ -304,11 +304,18 @@ label_source = construct_nominal_weak_supervision
 chunk_size_samples = 12000
 ```
 
-chunk 长度必须满足：
+补齐后的模型输入长度必须满足：
 
 ```text
 chunk_size_samples % 12 == 0
 ```
+
+无 head 的 v3 manifest 将实际保留区间写在 `chunk_start_sample/chunk_end_sample`，
+将补齐后的固定输入大小写在 `model_input_samples`。Dataset 仅截取该区间，
+归一化后右侧补零；补零位置通过 raw/encoder padding mask 排除定位 loss 和
+长度池化。真实区间可以短于 12000，也不必是 12 的倍数。超过输入上限者拒绝。
+`head_excluded=true` 和 `head_boundary_sample` 用于检查正反向输入均不跨入 head。
+排除保证依据 Dorado 比对与 move table，仍需要人工审计实际边界。
 
 对 `poly_present` 记录，当前训练要求整个 Poly 区间位于 chunk 内：
 
@@ -338,8 +345,8 @@ train 和 validation 可以来自相同 POD5 文件，但必须避免同一 read
 
 ## 6. Manifest schema
 
-每行表示一个固定长度 read chunk。当前权威 schema 位于
-`src/holypoly/training_data.py`。
+每行表示一个真实信号区间及其固定模型输入大小。当前权威 schema 位于
+`src/holypoly/training/data.py`。
 
 必需字段包括：
 
@@ -463,7 +470,7 @@ uv run holypoly train --epochs 1 --batch-size 1
 - 固定随机种子下结果可重复；
 - basecalling 输出接口未改变。
 
-## 9. 当前工具缺口
+## 9. 当前工具与限制
 
 当前仓库已经包含：
 
@@ -476,7 +483,11 @@ uv run holypoly train --epochs 1 --batch-size 1
 - checkpoint、恢复和基础指标；
 - synthetic test 和真实数据 smoke test。
 
-当前尚缺少生产级 dataset/manifest builder。该工具需要完成：
+当前已有面向固定长度构建的精简 builder：
+`src/holypoly/datasets/prepare.py`，用法见 [prepare_dataset.md](prepare_dataset.md)。
+它完成 UUID 关联、0A provisional flank 推定、Dorado move 映射、均衡抽样、
+无 read 泄漏划分及现有训练接口的 manifest 校验。
+边界仍未经独立验证，不支持截断 Poly 训练或通用构建结构。完整流程包括：
 
 ```text
 BAM + move table + POD5 + reference/construct metadata
@@ -490,7 +501,18 @@ BAM + move table + POD5 + reference/construct metadata
                         -> versioned training manifest
 ```
 
-实现该工具前，需要先确认以下科学定义：
+上述精简 builder 已明确采用标称长度弱监督、最多连续 2 个非目标碱基中断、
+双侧锚点完整性检查及已验证 0A 负样本。
+
+经确认的启动训练妥协为：正长度构建缺少可靠 Poly 边界时，允许
+`supervision_mode=length_only`。该模式保留标称长度，未知边界、完整性和观察长度
+留空，输入覆盖 head 后的可见 signal（可以含 flank），定位与状态 loss 均忽略。
+它不声称 read 的 Poly 完整；v3 短候选右侧补零，无法放入固定输入的候选仍被拒绝。
+完整操作说明见 [无 head 数据集准备](prepare_dataset.md)。旧 manifest 保持兼容；
+仅重新制作的数据带有 head 排除保证，应使用新的 checkpoint 从头训练。
+0A 仍须通过双侧锚点检查。缺少 `supervision_mode` 的旧 manifest 按完整监督处理。
+
+扩展为其他数据流程前仍须确认：
 
 1. `training_length_nt` 的首选证据来源；
 2. Poly 中断规则的精确定义；
@@ -508,4 +530,3 @@ BAM + move table + POD5 + reference/construct metadata
 5. 完成单 GPU 小规模训练和 checkpoint 恢复验证；
 6. 在独立 POD5/run 上建立只用于最终评价的 test split；
 7. 只有获得可靠 read-level 标签后，才报告正式 MAE 和 tolerance accuracy。
-

@@ -5,8 +5,8 @@ import subprocess
 from pathlib import Path
 
 
-def test_poly_heads_in_isolated_bonito_environment() -> None:
-    """Run Torch-dependent unit tests in Bonito's isolated environment."""
+def test_isolated_modules_in_bonito_environment() -> None:
+    """Run dependency-isolated module tests in Bonito's isolated environment."""
     project_root = Path(__file__).resolve().parents[1]
     python_path = project_root / "src" / "bonito" / ".venv" / "bin" / "python"
     assert python_path.is_file(), (
@@ -21,7 +21,7 @@ def test_poly_heads_in_isolated_bonito_environment() -> None:
             "-m",
             "pytest",
             "-q",
-            "tests/torch",
+            "tests/isolated",
         ],
         cwd=project_root,
         env=environment,

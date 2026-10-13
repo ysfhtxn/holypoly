@@ -7,14 +7,21 @@ from pathlib import Path
 import pytest
 import toml
 import torch
-from test_poly_heads import _tiny_v5_basecaller
 from torch.utils.data import DataLoader
 
-from holypoly.losses import PolyAuxiliaryLoss, PolyLossWeights
-from holypoly.model import HolypolyModel, load_bonito_v5_model
-from holypoly.poly_heads import PolyClass, ReadStatus
-from holypoly.training import (
+from holypoly.models.model import HolypolyModel, load_bonito_v5_model
+from holypoly.models.poly_heads import PolyClass, ReadStatus
+from holypoly.training.data import (
+    ManifestSplit,
+    Pod5SignalReader,
+    PolyTrainingBatch,
+    PolyTrainingDataset,
+    collate_poly_training_examples,
+    load_training_manifest,
+)
+from holypoly.training.engine import (
     CheckpointContext,
+    _MetricAccumulator,
     append_loss_log,
     create_optimizer,
     load_checkpoint,
@@ -23,14 +30,8 @@ from holypoly.training import (
     train_one_epoch,
     validate_one_epoch,
 )
-from holypoly.training_data import (
-    ManifestSplit,
-    Pod5SignalReader,
-    PolyTrainingBatch,
-    PolyTrainingDataset,
-    collate_poly_training_examples,
-    load_training_manifest,
-)
+from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
+from tests.isolated.helpers import tiny_v5_basecaller
 
 
 def _synthetic_batch() -> PolyTrainingBatch:
@@ -95,7 +96,7 @@ def _losses_on_batch(
 
 def test_holypoly_model_freezes_bonito_and_optimizer_uses_only_heads() -> None:
     torch.manual_seed(20260923)
-    basecaller = _tiny_v5_basecaller()
+    basecaller = tiny_v5_basecaller()
     signal = torch.randn(2, 1, 120)
     original_scores = basecaller(signal)
     model = HolypolyModel(basecaller, hidden_features=16)
@@ -131,7 +132,7 @@ def test_holypoly_model_freezes_bonito_and_optimizer_uses_only_heads() -> None:
 
 
 def test_independent_loss_masks_failure_padding_and_invalid_lengths() -> None:
-    model = HolypolyModel(_tiny_v5_basecaller(), hidden_features=16)
+    model = HolypolyModel(tiny_v5_basecaller(), hidden_features=16)
     criterion = PolyAuxiliaryLoss(PolyLossWeights(2.0, 3.0, 4.0))
     batch = _synthetic_batch()
     losses, _ = _losses_on_batch(model, criterion, batch, torch.device("cpu"))
@@ -156,12 +157,67 @@ def test_independent_loss_masks_failure_padding_and_invalid_lengths() -> None:
         )
 
 
+def test_length_only_batch_has_finite_loss_and_only_length_gradients() -> None:
+    model = HolypolyModel(tiny_v5_basecaller(), hidden_features=16)
+    criterion = PolyAuxiliaryLoss(PolyLossWeights())
+    batch = _synthetic_batch()
+    batch.location_targets.fill_(-100)
+    batch.status_targets.fill_(-100)
+    batch.true_length_nt[4:] = 20  # All six now have positive weak length targets.
+    losses, output = _losses_on_batch(model, criterion, batch, torch.device("cpu"))
+    assert losses["location_examples"].item() == 0
+    assert losses["status_examples"].item() == 0
+    assert losses["length_examples"].item() == 6
+    assert losses["location_loss"].item() == losses["status_loss"].item() == 0
+    assert torch.isfinite(losses["total_loss"])
+    adapter_losses = model.multitask.auxiliary_loss(
+        output, batch.location_targets, batch.true_length_nt, batch.status_targets
+    )
+    assert torch.equal(adapter_losses["total_loss"], losses["total_loss"])
+    losses["total_loss"].backward()
+    assert all(parameter.grad is None for parameter in model.basecaller.parameters())
+    assert all(
+        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+        for parameter in model.location_head.parameters()
+    )
+    assert torch.count_nonzero(model.length_head.length_regressor.weight.grad) > 0
+    accumulator = _MetricAccumulator()
+    accumulator.update(output, batch, losses)
+    assert math.isnan(accumulator.result(0).status_accuracy)
+    # Adding one supervised status must use one, rather than six, in its denominator.
+    batch.status_targets[0] = int(
+        ((output.location.status_logits + output.length.status_logits) / 2).argmax(-1)[
+            0
+        ]
+    )
+    accumulator = _MetricAccumulator()
+    accumulator.update(output, batch, losses)
+    assert accumulator.result(0).status_accuracy == 1.0
+    batch.location_targets[0].fill_(0)
+    mixed_losses = criterion(
+        output, batch.location_targets, batch.true_length_nt, batch.status_targets
+    )
+    assert mixed_losses["status_examples"].item() == 1
+    assert mixed_losses["location_examples"].item() == 20
+    assert torch.equal(
+        mixed_losses["location_loss"],
+        torch.nn.functional.cross_entropy(
+            output.location.location_logits[0], batch.location_targets[0]
+        ),
+    )
+    shared_logits = (output.location.status_logits + output.length.status_logits) / 2
+    assert torch.equal(
+        mixed_losses["status_loss"],
+        torch.nn.functional.cross_entropy(shared_logits[:1], batch.status_targets[:1]),
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_synthetic_overfit_and_checkpoint_roundtrip(tmp_path: Path) -> None:
     device = torch.device("cuda:0")
     set_random_seed(20260923)
     batch = _synthetic_batch()
-    model = HolypolyModel(_tiny_v5_basecaller(), hidden_features=32).to(device)
+    model = HolypolyModel(tiny_v5_basecaller(), hidden_features=32).to(device)
     criterion = PolyAuxiliaryLoss(PolyLossWeights())
     optimizer = create_optimizer(model, learning_rate=2e-2, weight_decay=0.0)
     model.eval()
@@ -232,7 +288,7 @@ def test_synthetic_overfit_and_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert payload["pytorch_version"]
     assert payload["cuda_version"]
 
-    restored = HolypolyModel(_tiny_v5_basecaller(), hidden_features=32).to(device)
+    restored = HolypolyModel(tiny_v5_basecaller(), hidden_features=32).to(device)
     restored_optimizer = create_optimizer(
         restored, learning_rate=2e-2, weight_decay=0.0
     )

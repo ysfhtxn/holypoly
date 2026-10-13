@@ -8,7 +8,7 @@ from typing import Any, Self, cast
 
 from torch import Tensor, nn
 
-from holypoly.poly_heads import BonitoMultiTaskOutput, BonitoV5MultiTaskModel
+from holypoly.models.poly_heads import BonitoMultiTaskOutput, BonitoV5MultiTaskModel
 
 
 class HolypolyModel(nn.Module):

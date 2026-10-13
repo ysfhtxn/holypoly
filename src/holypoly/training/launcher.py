@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from holypoly.config import AppConfig, TrainingConfig
+from holypoly.core.config import AppConfig, TrainingConfig
 
 
 class TrainingLaunchError(ValueError):
@@ -50,7 +50,7 @@ def launch_training(
     command = [
         str(python_path),
         "-m",
-        "holypoly.train_command",
+        "holypoly.training.command",
         "--data-root",
         str(paths.data_root),
         "--work-root",

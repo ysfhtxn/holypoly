@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from holypoly.config import AppConfig, DoctorConfig, PathsConfig, TrainingConfig
-from holypoly.train_launcher import (
+from holypoly.core.config import AppConfig, DoctorConfig, PathsConfig, TrainingConfig
+from holypoly.training.launcher import (
     TrainingLaunchError,
     launch_training,
     resolve_training_paths,
@@ -95,7 +95,7 @@ def test_launcher_uses_bonito_environment(
         captured.update(kwargs)
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr("holypoly.train_launcher.subprocess.run", fake_run)
+    monkeypatch.setattr("holypoly.training.launcher.subprocess.run", fake_run)
 
     return_code = launch_training(
         _config(data_root, work_root),
@@ -107,7 +107,7 @@ def test_launcher_uses_bonito_environment(
 
     command = captured["command"]
     assert isinstance(command, list)
-    assert command[:3] == [str(python_path), "-m", "holypoly.train_command"]
+    assert command[:3] == [str(python_path), "-m", "holypoly.training.command"]
     assert "--dry-run" in command
     assert captured["cwd"] == project_root
     environment = captured["env"]

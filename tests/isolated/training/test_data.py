@@ -8,26 +8,27 @@ import pytest
 import toml
 import torch
 from bonito.transformer import Model as TransformerModel
-from test_poly_heads import _tiny_v5_basecaller
 
-from holypoly.poly_heads import (
+from holypoly.models.poly_heads import (
     BONITO_V5_STRIDE,
     BonitoV5MultiTaskModel,
     ReadStatus,
     encoder_interval_to_raw_interval,
     raw_interval_to_encoder_interval,
 )
-from holypoly.training_data import (
+from holypoly.training.data import (
     BONITO_V5_INPUT_ALIGNMENT,
     LOCATION_IGNORE_INDEX,
     ManifestLabelStatus,
     ManifestPolyType,
     ManifestSplit,
+    ManifestSupervisionMode,
     PolyTrainingDataset,
     PolyTrainingRecord,
     collate_poly_training_examples,
     load_training_manifest,
 )
+from tests.isolated.helpers import tiny_v5_basecaller
 
 FIELDNAMES = [
     "manifest_version",
@@ -88,7 +89,17 @@ def _row(**overrides: object) -> dict[str, object]:
 
 def _write_manifest(path: Path, rows: list[dict[str, object]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDNAMES, delimiter="\t")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=FIELDNAMES
+            + [
+                "supervision_mode",
+                "model_input_samples",
+                "head_excluded",
+                "head_boundary_sample",
+            ],
+            delimiter="\t",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -225,12 +236,63 @@ def test_manifest_schema_rejects_unsafe_labels(
         load_training_manifest(manifest)
 
 
+def test_nominal_zero_does_not_override_observed_positive_label(tmp_path: Path) -> None:
+    manifest = tmp_path / "nominal-zero.tsv"
+    _write_manifest(manifest, [_row(nominal_length_nt=0)])
+    record = load_training_manifest(manifest)[0]
+    assert record.nominal_length_nt == 0
+    assert record.label_status is ManifestLabelStatus.POLY_PRESENT
+    assert record.true_length_nt == 20
+
+
+@pytest.mark.parametrize("nominal", [-1, "", "nan"])
+def test_invalid_nominal_positive_record_still_rejected(
+    tmp_path: Path, nominal: object
+) -> None:
+    manifest = tmp_path / "invalid-nominal.tsv"
+    _write_manifest(manifest, [_row(nominal_length_nt=nominal)])
+    with pytest.raises(ValueError, match="non-negative nominal_length_nt"):
+        load_training_manifest(manifest)
+
+
 def test_manifest_rejects_duplicate_read_chunk(tmp_path: Path) -> None:
     manifest = tmp_path / "duplicate.tsv"
     _write_manifest(manifest, [_row(), _row()])
 
     with pytest.raises(ValueError, match="duplicate read/chunk"):
         load_training_manifest(manifest)
+
+
+def test_length_only_manifest_keeps_unknowns_and_masks_location_status(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "weak.tsv"
+    weak = _row(
+        supervision_mode="length_only",
+        poly_start_sample="",
+        poly_end_sample="",
+        poly_is_complete="",
+        observed_sequence_length_nt="",
+        label_source="construct_nominal_weak_supervision",
+    )
+    _write_manifest(path, [weak])
+    records = load_training_manifest(path)
+    assert records[0].supervision_mode is ManifestSupervisionMode.LENGTH_ONLY
+    assert math.isnan(records[0].observed_sequence_length_nt)
+    dataset = PolyTrainingDataset(records, lambda path, read_id: torch.zeros(240))
+    batch = collate_poly_training_examples([dataset[0]])
+    assert torch.all(batch.location_targets == -100)
+    assert batch.status_targets.tolist() == [-100]
+    assert batch.true_length_nt.tolist() == [20]
+    for field, value in [
+        ("poly_start_sample", 84),
+        ("poly_is_complete", "true"),
+        ("observed_sequence_length_nt", 18),
+        ("training_length_nt", 19),
+    ]:
+        _write_manifest(path, [{**weak, field: value}])
+        with pytest.raises(ValueError, match="length_only"):
+            load_training_manifest(path)
 
 
 def test_dataset_reads_only_requested_fixed_chunks_and_collates_labels() -> None:
@@ -310,6 +372,162 @@ def test_dataset_rejects_misaligned_or_variable_chunks() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"head_excluded": "false"}, "v3 requires head_excluded"),
+        ({"head_boundary_sample": ""}, "requires a boundary"),
+        ({"model_input_samples": ""}, "requires a boundary"),
+        ({"model_input_samples": 60}, "invalid model_input_samples"),
+        ({"model_input_samples": 121}, "invalid model_input_samples"),
+        ({"head_boundary_sample": 61}, "includes signal on the head side"),
+        (
+            {"orientation": "reverse", "head_boundary_sample": 179},
+            "includes signal on the head side",
+        ),
+    ],
+)
+def test_manifest_rejects_unsafe_head_exclusion(
+    tmp_path: Path, overrides: dict[str, object], message: str
+) -> None:
+    manifest = tmp_path / "head-free.tsv"
+    row = _row(
+        manifest_version="construct-nominal-head-excluded-v3",
+        orientation="forward",
+        head_excluded="true",
+        head_boundary_sample=60,
+        model_input_samples=120,
+    )
+    row.update(overrides)
+    _write_manifest(manifest, [row])
+    with pytest.raises(ValueError, match=message):
+        load_training_manifest(manifest)
+
+
+def test_head_free_padded_inputs_masks_and_backward(tmp_path: Path) -> None:
+    """Both acquisition directions exclude head, including from length features."""
+    torch.manual_seed(37)
+    manifest = tmp_path / "head-free.tsv"
+    common = {
+        "manifest_version": "construct-nominal-head-excluded-v3",
+        "head_excluded": "true",
+        "model_input_samples": 120,
+    }
+    _write_manifest(
+        manifest,
+        [
+            _row(
+                **common,
+                orientation="forward",
+                head_boundary_sample=60,
+                chunk_end_sample=139,
+            ),
+            _row(
+                **common,
+                read_id="reverse",
+                orientation="reverse",
+                head_boundary_sample=180,
+                chunk_start_sample=101,
+                poly_start_sample=126,
+                poly_end_sample=180,
+                poly_type="polyT",
+            ),
+            _row(
+                **common,
+                read_id="zero",
+                orientation="forward",
+                head_boundary_sample=60,
+                chunk_end_sample=115,
+                poly_start_sample="",
+                poly_end_sample="",
+                poly_type="none",
+                label_status="zero_nt",
+                poly_is_complete="",
+                training_length_nt=0,
+                nominal_length_nt=0,
+                observed_sequence_length_nt=0,
+            ),
+            _row(
+                **common,
+                read_id="weak",
+                orientation="forward",
+                head_boundary_sample=60,
+                chunk_end_sample=97,
+                supervision_mode="length_only",
+                poly_start_sample="",
+                poly_end_sample="",
+                poly_is_complete="",
+                observed_sequence_length_nt="",
+                label_source="construct_nominal_weak_supervision",
+            ),
+        ],
+    )
+    records = load_training_manifest(manifest)
+    signals = {r.read_id: torch.randn(240) for r in records}
+    for record in records:
+        if record.orientation == "forward":
+            signals[record.read_id][: record.head_boundary_sample] = 999
+        else:
+            signals[record.read_id][record.head_boundary_sample :] = 999
+    dataset = PolyTrainingDataset(records, lambda _, read_id: signals[read_id])
+    examples = [dataset[i] for i in range(len(dataset))]
+    batch = collate_poly_training_examples(examples)
+    assert batch.signal.shape == (4, 1, 120)
+    assert batch.raw_lengths_samples.tolist() == [79, 79, 55, 37]
+    assert batch.raw_padding_mask.sum(dim=1).tolist() == [41, 41, 65, 83]
+    assert not torch.any(batch.signal == 999)
+    for i, record in enumerate(records):
+        length = record.chunk_length_samples
+        assert torch.equal(
+            batch.signal[i, 0, :length],
+            signals[record.read_id][
+                record.chunk_start_sample : record.chunk_end_sample
+            ],
+        )
+        assert torch.all(batch.signal[i, 0, length:] == 0)
+    assert (
+        batch.location_targets[0].tolist() == [0] * 4 + [1] * 7 + [0] * 3 + [-100] * 6
+    )
+    assert batch.location_targets[1].tolist() == [0] * 4 + [2] * 10 + [-100] * 6
+    assert batch.location_targets[2].tolist() == [0] * 10 + [-100] * 10
+    assert torch.all(batch.location_targets[3] == LOCATION_IGNORE_INDEX)
+    assert batch.status_targets.tolist() == [0, 0, 1, -100]
+
+    model = BonitoV5MultiTaskModel(tiny_v5_basecaller(), hidden_features=6)
+    model.eval()
+    for parameter in model.basecaller.parameters():
+        parameter.requires_grad_(False)
+    output = model(batch.signal, batch.raw_padding_mask)
+    assert output.location.padding_mask.sum(dim=1).tolist() == [6, 6, 10, 13]
+    losses = model.auxiliary_loss(
+        output, batch.location_targets, batch.true_length_nt, batch.status_targets
+    )
+    assert all(torch.isfinite(loss) for loss in losses.values())
+    losses["total_loss"].backward()
+    assert all(p.grad is None for p in model.basecaller.parameters())
+    assert any(
+        p.grad is not None and torch.any(p.grad != 0)
+        for p in model.length_head.parameters()
+    )
+    assert any(
+        p.grad is not None and torch.any(p.grad != 0)
+        for p in model.location_head.parameters()
+    )
+
+    # Alter only excluded head samples: neither input nor regression may change.
+    for record in records:
+        signal = signals[record.read_id]
+        if record.orientation == "forward":
+            signal[: record.head_boundary_sample] = -999
+        else:
+            signal[record.head_boundary_sample :] = -999
+    changed = collate_poly_training_examples([dataset[i] for i in range(len(dataset))])
+    assert torch.equal(batch.signal, changed.signal)
+    with torch.no_grad():
+        changed_output = model(changed.signal, changed.raw_padding_mask)
+    assert torch.equal(output.length.length_nt, changed_output.length.length_nt)
+
+
 def test_raw_to_encoder_mapping_is_stable_for_aligned_chunks() -> None:
     chunk_size = 120
     feature_steps = chunk_size // BONITO_V5_STRIDE
@@ -358,7 +576,7 @@ def _run_batch_forward_backward(device: torch.device) -> None:
         lambda _path, read_id: signals[read_id],
     )
     batch = collate_poly_training_examples([dataset[0], dataset[1]])
-    model = BonitoV5MultiTaskModel(_tiny_v5_basecaller(), hidden_features=6).to(device)
+    model = BonitoV5MultiTaskModel(tiny_v5_basecaller(), hidden_features=6).to(device)
     for parameter in model.basecaller.parameters():
         parameter.requires_grad_(False)
 
@@ -401,7 +619,7 @@ def test_collated_batch_matches_v5_adapter_on_gpu() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_official_v5_encoder_steps_match_collated_targets_on_gpu() -> None:
     config_path = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "src"
         / "bonito"
         / "bonito"

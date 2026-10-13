@@ -15,9 +15,16 @@ import toml
 import torch
 from torch.utils.data import DataLoader
 
-from holypoly.losses import PolyAuxiliaryLoss, PolyLossWeights
-from holypoly.model import HolypolyModel, load_bonito_v5_model
-from holypoly.training import (
+from holypoly.models.model import HolypolyModel, load_bonito_v5_model
+from holypoly.training.data import (
+    ManifestSplit,
+    Pod5SignalReader,
+    PolyTrainingDataset,
+    PolyTrainingRecord,
+    collate_poly_training_examples,
+    load_training_manifest,
+)
+from holypoly.training.engine import (
     CheckpointContext,
     append_loss_log,
     create_optimizer,
@@ -28,14 +35,7 @@ from holypoly.training import (
     train_one_epoch,
     validate_one_epoch,
 )
-from holypoly.training_data import (
-    ManifestSplit,
-    Pod5SignalReader,
-    PolyTrainingDataset,
-    PolyTrainingRecord,
-    collate_poly_training_examples,
-    load_training_manifest,
-)
+from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -195,7 +195,7 @@ def run(args: argparse.Namespace) -> int:
                 f"epochs {args.epochs}"
             )
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[3]
     context = CheckpointContext(
         random_seed=args.random_seed,
         bonito_commit=_git_commit(project_root / "src" / "bonito"),
@@ -213,6 +213,7 @@ def run(args: argparse.Namespace) -> int:
             device=device,
             gradient_clip_norm=args.gradient_clip_norm,
             global_step=global_step,
+            progress_desc=f"Epoch {epoch}/{args.epochs} train",
         )
         global_step = train_result.global_step
         validation_result = validate_one_epoch(
@@ -221,6 +222,7 @@ def run(args: argparse.Namespace) -> int:
             criterion,
             device=device,
             global_step=global_step,
+            progress_desc=f"Epoch {epoch}/{args.epochs} validation",
         )
         append_loss_log(loss_log_path, train_result, epoch=epoch, split="train")
         append_loss_log(

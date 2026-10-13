@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from holypoly.train_command import _validate_manifest_sources, main
-from holypoly.training_data import (
+from holypoly.training.command import _validate_manifest_sources, main
+from holypoly.training.data import (
     ManifestLabelStatus,
     ManifestPolyType,
     ManifestSplit,

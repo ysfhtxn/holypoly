@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pysam
 
-from holypoly.length_groups import (
+from holypoly.datasets.length_groups import (
     build_length_groups,
     load_reference_catalog,
     parse_nominal_length_nt,

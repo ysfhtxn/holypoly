@@ -8,19 +8,11 @@ import pytest
 import toml
 import torch
 import torch.nn.functional as functional
-from bonito.crf.model import CTC_CRF, SeqdistModel
-from bonito.nn import (
-    Convolution,
-    LinearCRFEncoder,
-    LinearUpsample,
-    NamedSerial,
-    Permute,
-    Serial,
-)
+from bonito.crf.model import SeqdistModel
 from bonito.transformer import Model as TransformerModel
 from torch import nn
 
-from holypoly.poly_heads import (
+from holypoly.models.poly_heads import (
     BONITO_V5_STRIDE,
     BonitoV5MultiTaskModel,
     PolyClass,
@@ -32,32 +24,7 @@ from holypoly.poly_heads import (
     make_location_targets,
     raw_interval_to_encoder_interval,
 )
-
-
-def _tiny_v5_basecaller() -> SeqdistModel:
-    encoder = NamedSerial(
-        {
-            "conv": Serial(
-                [
-                    Convolution(1, 8, 3, stride=3, padding=1, activation="swish"),
-                    Convolution(8, 8, 3, stride=2, padding=1, activation="swish"),
-                    Convolution(8, 8, 3, stride=2, padding=1, activation="swish"),
-                    Permute([0, 2, 1]),
-                ]
-            ),
-            "transformer_encoder": nn.Identity(),
-            "upsample": LinearUpsample(d_model=8, scale_factor=2),
-            "crf": LinearCRFEncoder(
-                insize=8,
-                n_base=4,
-                state_len=1,
-                bias=False,
-                blank_score=2.0,
-                permute=[1, 0, 2],
-            ),
-        }
-    )
-    return SeqdistModel(encoder, CTC_CRF(1, ["N", "A", "C", "G", "T"]))
+from tests.isolated.helpers import tiny_v5_basecaller
 
 
 def _assert_nonzero_gradients(module: nn.Module) -> None:
@@ -258,7 +225,7 @@ def test_location_decoder_keeps_background_interruptions_separate() -> None:
 
 def test_v5_adapter_preserves_basecall_scores_and_returns_heads() -> None:
     torch.manual_seed(23)
-    basecaller = _tiny_v5_basecaller().eval()
+    basecaller = tiny_v5_basecaller().eval()
     adapter = BonitoV5MultiTaskModel(basecaller, hidden_features=6).eval()
     signal = torch.randn(2, 1, 24)
 
@@ -275,7 +242,7 @@ def test_v5_adapter_preserves_basecall_scores_and_returns_heads() -> None:
 
 def test_official_v5_config_uses_expected_adapter_tap() -> None:
     config_path = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "src"
         / "bonito"
         / "bonito"
@@ -294,7 +261,7 @@ def test_official_v5_config_uses_expected_adapter_tap() -> None:
 def test_v5_adapter_auxiliary_loss_has_one_shared_status_term() -> None:
     torch.manual_seed(29)
     adapter = BonitoV5MultiTaskModel(
-        _tiny_v5_basecaller(),
+        tiny_v5_basecaller(),
         hidden_features=6,
         lambda_location=2.0,
         lambda_length=3.0,
@@ -322,7 +289,7 @@ def test_v5_adapter_auxiliary_loss_has_one_shared_status_term() -> None:
 
 def test_v5_adapter_freeze_unfreeze_and_state_dict_roundtrip() -> None:
     torch.manual_seed(31)
-    adapter = BonitoV5MultiTaskModel(_tiny_v5_basecaller(), hidden_features=6)
+    adapter = BonitoV5MultiTaskModel(tiny_v5_basecaller(), hidden_features=6)
     signal = torch.randn(2, 1, 24)
     location_targets = torch.tensor([[0, 1, 1, 0], [2, 2, 0, 0]])
     lengths = torch.tensor([12.0, 12.0])
@@ -338,7 +305,7 @@ def test_v5_adapter_freeze_unfreeze_and_state_dict_roundtrip() -> None:
     _assert_nonzero_gradients(adapter.location_head)
     _assert_nonzero_gradients(adapter.length_head)
 
-    unfrozen = BonitoV5MultiTaskModel(_tiny_v5_basecaller(), hidden_features=6)
+    unfrozen = BonitoV5MultiTaskModel(tiny_v5_basecaller(), hidden_features=6)
     unfrozen_output = unfrozen(signal)
     unfrozen.auxiliary_loss(unfrozen_output, location_targets, lengths, statuses)[
         "total_loss"
@@ -363,7 +330,7 @@ def test_v5_adapter_freeze_unfreeze_and_state_dict_roundtrip() -> None:
     buffer = io.BytesIO()
     torch.save(unfrozen.state_dict(), buffer)
     buffer.seek(0)
-    restored = BonitoV5MultiTaskModel(_tiny_v5_basecaller(), hidden_features=6)
+    restored = BonitoV5MultiTaskModel(tiny_v5_basecaller(), hidden_features=6)
     restored.load_state_dict(torch.load(buffer, weights_only=True))
     restored.eval()
     actual = restored(signal)
@@ -375,7 +342,7 @@ def test_v5_adapter_freeze_unfreeze_and_state_dict_roundtrip() -> None:
 
 
 def test_basecall_loss_delegates_to_bonito_model() -> None:
-    basecaller = _tiny_v5_basecaller()
+    basecaller = tiny_v5_basecaller()
 
     def fake_loss(self: SeqdistModel, value: torch.Tensor) -> dict[str, torch.Tensor]:
         del self
@@ -390,9 +357,7 @@ def test_basecall_loss_delegates_to_bonito_model() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_v5_adapter_gpu_forward_backward() -> None:
     device = torch.device("cuda:0")
-    adapter = BonitoV5MultiTaskModel(_tiny_v5_basecaller(), hidden_features=6).to(
-        device
-    )
+    adapter = BonitoV5MultiTaskModel(tiny_v5_basecaller(), hidden_features=6).to(device)
     signal = torch.randn(2, 1, 24, device=device)
     output = adapter(signal)
     losses = adapter.auxiliary_loss(
@@ -409,7 +374,7 @@ def test_adapter_rejects_non_v5_backbone_and_invalid_signal_masks() -> None:
     with pytest.raises(TypeError, match="Bonito v5 encoder layers"):
         BonitoV5MultiTaskModel(nn.Linear(2, 2))
 
-    adapter = BonitoV5MultiTaskModel(_tiny_v5_basecaller())
+    adapter = BonitoV5MultiTaskModel(tiny_v5_basecaller())
     with pytest.raises(ValueError, match="at least one read"):
         adapter(torch.randn(0, 1, 24))
     with pytest.raises(ValueError, match="suffix padding"):
@@ -420,7 +385,7 @@ def test_adapter_rejects_non_v5_backbone_and_invalid_signal_masks() -> None:
 
 
 def test_raw_padding_mask_supports_different_read_lengths() -> None:
-    adapter = BonitoV5MultiTaskModel(_tiny_v5_basecaller())
+    adapter = BonitoV5MultiTaskModel(tiny_v5_basecaller())
     signal = torch.randn(2, 1, 24)
     mask = torch.tensor([[False] * 24, [False] * 12 + [True] * 12], dtype=torch.bool)
     output = adapter(signal, mask)

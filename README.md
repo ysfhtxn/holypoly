@@ -4,6 +4,44 @@
 长度估计提供工具。本阶段只包含项目初始化与外部数据环境体检，不执行 basecalling、
 GPU 任务、模型训练或完整原始信号读取。
 
+## 代码与测试组织
+
+```text
+src/holypoly/
+├── cli.py                 # 公共 CLI，仅负责参数和分发
+├── core/                  # 配置、外部环境体检
+├── datasets/              # 离线数据准备，不包含模型或训练循环
+├── models/                # Bonito 适配器、Poly heads
+└── training/              # manifest 消费、loss、训练循环和启动器
+
+tests/
+├── unit/
+│   ├── core/
+│   └── training/
+├── isolated/              # 在 Bonito 独立环境中执行
+│   ├── datasets/
+│   ├── models/
+│   └── training/
+└── test_isolated_environment.py
+```
+
+`datasets/` 负责制作数据；`training/data.py` 只负责读取已有训练 manifest、
+signal chunk 和 batch，不负责制作数据集。各包的 `__init__.py` 不主动加载重型依赖，
+CLI 与训练启动器仍可在父项目环境运行。原平铺模块的 Python 导入路径已迁移到对应
+子包，`holypoly doctor` 和 `holypoly train` 命令保持不变。
+
+训练后导出 test split 预测、分组指标及调用训练汇总绘图脚本，见
+[训练、测试与绘图流程](docs/evaluate_model.md)。
+常用命令速查见 [常用命令](docs/common_commands.md)。
+
+根目录 pytest 运行 `unit/`，并通过 subprocess 在 `src/bonito/.venv` 中运行
+`isolated/`。也可单独执行：
+
+```bash
+uv run pytest -q tests/unit
+PYTHONPATH=src src/bonito/.venv/bin/python -m pytest -q tests/isolated
+```
+
 ## 安装
 
 项目要求 Python 3.11，并使用 [uv](https://docs.astral.sh/uv/) 管理环境：
@@ -67,7 +105,7 @@ uv run pytest -q
 
 ## 多任务 head 原型
 
-`src/holypoly/poly_heads.py` 提供 Bonito v5 Transformer 专用的
+`src/holypoly/models/poly_heads.py` 提供 Bonito v5 Transformer 专用的
 `BonitoV5MultiTaskModel`。它复用 v5 的 `conv -> transformer_encoder -> upsample`
 共享特征，再将同一特征分别送入原始 CRF basecalling head、
 `PolyLocationHead` 和 `PolyLengthHead`。原 basecalling scores 的 shape 和数值保持
@@ -102,18 +140,25 @@ Torch 和 Bonito 依赖安装到 holypoly 的 `.venv`。
 
 ## 辅助 head 训练数据接口
 
-`src/holypoly/training_data.py` 提供只读 manifest、固定长度 Dataset 和 collate。
+从 Bonito save-ctc BAM、Dorado move table 和 POD5 生成均衡训练 manifest：
+参见 [数据准备脚本与运行说明](docs/prepare_dataset.md)。脚本使用构建标称长度
+弱监督，从 0A 推定 provisional flank，保留失败审计，不复制原始信号。
+边界不确定的正构建可使用 `supervision_mode=length_only` 训练标称长度，
+同时跳过定位和状态 loss；旧 manifest 没有该字段时默认完整监督。
+
+`src/holypoly/training/data.py` 提供只读 manifest、固定长度 Dataset 和 collate。
 manifest 使用 CSV 或 TSV，每行对应一个 read chunk，必需字段为：
 
 ```text
 read_id, pod5_path, pod5_file_id, split, orientation,
 raw_signal_length, chunk_start_sample, chunk_end_sample,
-poly_start_sample, poly_end_sample, poly_type, true_length_nt,
+poly_start_sample, poly_end_sample, poly_type, training_length_nt,
 label_status, poly_is_complete, failure_reason
 ```
 
 所有 signal 和 Poly 坐标均使用原始 signal sample、0-based、左闭右开。训练 chunk
-必须完全包含 `poly_present` 区域、长度固定且能被 12 整除，从而使 Bonito v5 的
+完整监督 chunk 必须完全包含 `poly_present` 区域；所有 chunk 长度固定且能被 12
+整除，从而使 Bonito v5 的
 卷积和上采样输出严格对应 `chunk_size / 6` 个 encoder timestep。`zero_nt` 使用全
 background location 标签和 0 nt 长度；`failure` 使用 `-100` location 标签、空长度
 和明确的 `failure_reason`。
@@ -124,10 +169,10 @@ signal shift/scale。它不裁剪、修改或写入 POD5。Torch 相关测试继
 
 ## Milestone 3 冻结 encoder 训练
 
-`HolypolyModel` 位于 `src/holypoly/model.py`，默认冻结 Bonito v5 的 convolution、
+`HolypolyModel` 位于 `src/holypoly/models/model.py`，默认冻结 Bonito v5 的 convolution、
 Transformer、upsample 和原 CRF head，仅让 location/length 两个 Poly head 参与
-优化。`src/holypoly/losses.py` 提供独立的 masked auxiliary loss，
-`src/holypoly/training.py` 提供单 GPU epoch、验证、指标、日志和 checkpoint 恢复。
+优化。`src/holypoly/training/losses.py` 提供独立的 masked auxiliary loss，
+`src/holypoly/training/engine.py` 提供单 GPU epoch、验证、指标、日志和 checkpoint 恢复。
 
 真实 smoke manifest 必须放在外部 work root，并分别记录构建标称长度、Dorado
 观察长度和实际训练目标。当前 2p5per smoke 使用构建级 20 nt 弱监督与 provisional
@@ -167,12 +212,12 @@ train、validation 和 test 可以引用同一 POD5 文件，但不同 split 之
 
 ## 按参考名称整理标称长度数据
 
-`src/holypoly/length_groups.py` 从 Dorado BAM 的比对参考名称中解析 `<number>A`，
+`src/holypoly/datasets/length_groups.py` 从 Dorado BAM 的比对参考名称中解析 `<number>A`，
 并将 primary read 整理为按 `nominal_length_nt` 分组的压缩 TSV。该步骤只引用原
 BAM/POD5 路径，不复制或修改原始文件，也不会把构建标称长度描述为逐 read 真值。
 
 ```bash
-PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.length_groups \
+PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.length_groups \
   --data-root /path/to/fixed_len_data \
   --reference /path/to/fixed_len_data/fixed_len_ref.fa \
   --output-dir /path/to/fixed_len_data/derived/nominal_length_groups_v1

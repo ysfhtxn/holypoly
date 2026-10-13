@@ -7,9 +7,9 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from holypoly.config import ConfigError, load_config
-from holypoly.doctor import render_report, run_doctor
-from holypoly.train_launcher import (
+from holypoly.core.config import ConfigError, load_config
+from holypoly.core.doctor import render_report, run_doctor
+from holypoly.training.launcher import (
     TrainingLaunchError,
     apply_training_overrides,
     launch_training,

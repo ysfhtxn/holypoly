@@ -5,6 +5,7 @@ description = "Nanopore poly(A/T) data preparation and diagnostics."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib>=3.8",
     "pyyaml>=6.0.2",
 ]
 
@@ -48,29 +49,30 @@ module = [
     "toml",
     "torch",
     "torch.*",
+    "tqdm",
 ]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "holypoly.poly_heads"
+module = "holypoly.models.poly_heads"
 disallow_subclassing_any = false
 warn_return_any = false
 
 [[tool.mypy.overrides]]
 module = [
-    "holypoly.losses",
-    "holypoly.model",
-    "holypoly.training_data",
+    "holypoly.training.losses",
+    "holypoly.models.model",
+    "holypoly.training.data",
 ]
 disallow_subclassing_any = false
 
 [[tool.mypy.overrides]]
-module = "holypoly.model"
+module = "holypoly.models.model"
 warn_return_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["tests/torch"]
+norecursedirs = ["tests/isolated"]
 markers = [
     "integration: requires explicitly configured external data and model paths",
 ]

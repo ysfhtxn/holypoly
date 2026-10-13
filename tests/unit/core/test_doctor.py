@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from holypoly.config import AppConfig, DoctorConfig, PathsConfig
-from holypoly.doctor import CheckStatus, render_report, run_doctor
+from holypoly.core.config import AppConfig, DoctorConfig, PathsConfig
+from holypoly.core.doctor import CheckStatus, render_report, run_doctor
 
 
 def _config(data_root: Path, work_root: Path, sample_size: int = 2) -> AppConfig:

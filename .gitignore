@@ -23,6 +23,6 @@ configs/local.yaml
 *.ckpt
 
 results/
-models/
+/models/
 logs/
 cache/

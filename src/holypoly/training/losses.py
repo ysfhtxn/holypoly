@@ -8,7 +8,11 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
 
-from holypoly.poly_heads import BonitoMultiTaskOutput, ReadStatus
+from holypoly.models.poly_heads import (
+    BonitoMultiTaskOutput,
+    ReadStatus,
+    masked_status_loss,
+)
 
 
 @dataclass(frozen=True)
@@ -96,7 +100,8 @@ class PolyAuxiliaryLoss(nn.Module):
         shared_status_logits = (
             output.location.status_logits + output.length.status_logits
         ) / 2
-        status_loss = functional.cross_entropy(shared_status_logits, status_targets)
+        valid_status = status_targets != -100
+        status_loss = masked_status_loss(shared_status_logits, status_targets)
         weighted_location_loss = self.weights.lambda_location * location_loss
         weighted_length_loss = self.weights.lambda_length * length_loss
         weighted_status_loss = self.weights.lambda_status * status_loss
@@ -113,4 +118,5 @@ class PolyAuxiliaryLoss(nn.Module):
             "weighted_status_loss": weighted_status_loss,
             "location_examples": valid_locations.sum(),
             "length_examples": length_mask.sum(),
+            "status_examples": valid_status.sum(),
         }
