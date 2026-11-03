@@ -6,6 +6,9 @@ POD5。运行环境是 `src/bonito/.venv`，父项目不需要新增 Torch、POD
 
 ## 1. 训练
 
+常规新训练使用 [length + status + basecalling 默认流程](default_workflow.md)。
+下方 `holypoly train` 命令保留为历史冻结 encoder 对照。
+
 以下命令从项目根目录运行。模型目录、data root 和 work root 由本地配置提供，
 也可以使用 CLI 或已有环境变量。机器路径只保存在本地配置，不写入本说明。
 
@@ -29,7 +32,7 @@ PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.training.evaluate \
   --config configs/local.yaml \
   --manifest metadata/poly2p5per-train-v1/manifest.tsv \
   --checkpoint models/poly2p5per-train-v1/heads.pt \
-  --output-dir results/poly2p5per-train-v1/test-epoch1 \
+  --output-dir results/training_evaluation/poly2p5per-train-v1/test-epoch1 \
   --batch-size 32 --dry-run
 ```
 
@@ -45,7 +48,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
   --config configs/local.yaml \
   --manifest metadata/poly2p5per-train-v1/manifest.tsv \
   --checkpoint models/poly2p5per-train-v1/heads.pt \
-  --output-dir results/poly2p5per-train-v1/test-epoch1 \
+  --output-dir results/training_evaluation/poly2p5per-train-v1/test-epoch1 \
   --batch-size 32
 ```
 
@@ -64,7 +67,7 @@ batch size 32 的测试可能约 2–4 分钟，加上模型初始化；该时�
 随机抽样或完整 test 指标。`--max-reads 0` 默认处理整个 split。
 如需分析开发数据，可用 `--split validation`；不提供 train split 推理选项。
 
-输出位于 `<work_root>/results/poly2p5per-train-v1/test-epoch1/`：
+输出位于 `<work_root>/results/training_evaluation/poly2p5per-train-v1/test-epoch1/`：
 
 - `predictions.tsv`：每个 read 一行，包含标称长度、训练目标、观察序列长度、方向、
   poly 类型、监督方式、标签来源、原始回归长度、按状态解码的长度、状态置信度和
@@ -97,8 +100,8 @@ Matplotlib 已记录在根项目依赖中，使用 uv 环境运行，不依赖 C
 ```bash
 uv run python scripts/plot_training.py \
   --config configs/local.yaml \
-  --predictions results/poly2p5per-train-v1/test-epoch1/predictions.tsv \
-  --output results/poly2p5per-train-v1/test-epoch1/plots
+  --predictions results/training_evaluation/poly2p5per-train-v1/test-epoch1/predictions.tsv \
+  --output results/training_evaluation/poly2p5per-train-v1/test-epoch1/plots
 ```
 
 输出 `test_summary.png/.svg/.pdf` 四个面板：按标称长度的样本数量、分方向的预测
@@ -112,6 +115,12 @@ uv run python scripts/plot_training.py \
 默认合并两种监督方式。分别检查时加 `--supervision-mode full` 或
 `--supervision-mode length_only`，同时使用不同输出目录。
 横轴均注明标称长度，长度预测使用 `regression_length_nt`，与测试指标一致。
+所有长度横轴按实际 nt 数值排列：100→150 nt 的间距是 80→100 nt 的 2.5 倍，
+计数柱、箱线图和误差图的宽度及抖动也使用 nt 单位。
+标题、横轴及图例按所选预测行中的实际类型生成：仅 polyA 时只显示 polyA，
+仅 polyT 时只显示 polyT，两者都有时分别显示；0 nt 单独标为 `0 nt`。
+不为不存在的长度×类型组合绘制空柱或预留位置；单类型组位于其标称长度中心。
+`plot_summary.json` 记录 `poly_types`、`length_axis=numeric_nt` 和标称长度列表。
 该命令可以重复运行，会更新指定目录中的绘图文件；不会修改原测试结果。
 
 ## 5. 绘制训练日志
@@ -123,10 +132,15 @@ uv run python scripts/plot_training.py \
 uv run python scripts/plot_training.py \
   --config configs/local.yaml \
   --log logs/poly2p5per-train-v1/train.jsonl \
-  --output results/poly2p5per-train-v1/training-plots
+  --output results/training_evaluation/poly2p5per-train-v1/training-plots
 ```
 
 输出最新一轮的 loss/长度误差汇总 PNG、SVG、PDF，以及源指标和绘图脚本副本。
+同时导出 `training_curves.png/.svg/.pdf`：逐 epoch 的总 loss、长度误差、定位
+准确率、共享状态准确率、定位 IoU 和 macro F1；`loss_components.*` 分别画出
+定位、log-length 和状态 loss。所有曲线保留原始逐轮值，不平滑；`epoch_metrics.tsv`
+及 `source_training_history.json` 保留完整指标。定位/状态指标仅覆盖有对应监督的
+样本，IoU 为 timestep 聚合，不等于最终解码区间的逐 read IoU。
 `--log` 和 `--predictions` 二选一，分别用于训练汇总和逐 read 测试图。
 
 本次开发验证使用 synthetic 信号和 CPU，另对已有外部 manifest/checkpoint 做

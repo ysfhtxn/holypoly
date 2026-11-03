@@ -5,16 +5,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 import toml
 import torch
 from torch.utils.data import DataLoader
 
+from holypoly.models.length_head_config import LENGTH_HEAD_MODES
 from holypoly.models.model import HolypolyModel, load_bonito_v5_model
 from holypoly.training.data import (
     ManifestSplit,
@@ -28,6 +31,7 @@ from holypoly.training.engine import (
     CheckpointContext,
     append_loss_log,
     create_optimizer,
+    epoch_checkpoint_path,
     load_checkpoint,
     require_single_cuda_device,
     save_checkpoint,
@@ -35,6 +39,7 @@ from holypoly.training.engine import (
     train_one_epoch,
     validate_one_epoch,
 )
+from holypoly.training.loss_config import LENGTH_LOSS_MODES
 from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
 
 
@@ -51,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--chunk-size-samples", type=int, required=True)
     parser.add_argument("--hidden-features", type=int, required=True)
+    parser.add_argument("--length-head-mode", choices=LENGTH_HEAD_MODES, default="mean")
+    parser.add_argument("--data-order-seed", type=int)
     parser.add_argument("--dropout", type=float, required=True)
     parser.add_argument("--learning-rate", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
@@ -61,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-location", type=float, required=True)
     parser.add_argument("--lambda-length", type=float, required=True)
     parser.add_argument("--lambda-status", type=float, required=True)
+    parser.add_argument(
+        "--length-loss", choices=LENGTH_LOSS_MODES, default="log_smooth_l1"
+    )
+    parser.add_argument("--huber-delta-nt", type=float, default=10.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -72,7 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return run(args)
-    except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
         print(f"Training failed: {error}", file=sys.stderr)
         return 2
 
@@ -80,6 +91,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 def run(args: argparse.Namespace) -> int:
     """Execute one complete frozen-encoder training run."""
     _validate_arguments(args)
+    weights = PolyLossWeights(
+        lambda_location=args.lambda_location,
+        lambda_length=args.lambda_length,
+        lambda_status=args.lambda_status,
+        length_loss=args.length_loss,
+        huber_delta_nt=args.huber_delta_nt,
+    )
     data_root = args.data_root.expanduser().resolve()
     work_root = args.work_root.expanduser().resolve()
     manifest_path = args.manifest.expanduser().resolve()
@@ -98,6 +116,9 @@ def run(args: argparse.Namespace) -> int:
     records = load_training_manifest(manifest_path)
     _validate_manifest_sources(records, data_root=data_root)
     summary = _manifest_summary(records, epochs=args.epochs)
+    summary["length_head_mode"] = args.length_head_mode
+    summary["data_order_seed"] = args.data_order_seed
+    summary["loss_config"] = asdict(weights)
     print(json.dumps(summary, sort_keys=True))
     if summary["positive_length_values"] == 1:
         print(
@@ -143,10 +164,12 @@ def run(args: argparse.Namespace) -> int:
         split=ManifestSplit.VALIDATION,
         chunk_size_samples=args.chunk_size_samples,
     )
+    shuffle_generator = torch.Generator() if args.data_order_seed is not None else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        generator=shuffle_generator,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_poly_training_examples,
@@ -164,13 +187,9 @@ def run(args: argparse.Namespace) -> int:
     model = HolypolyModel(
         basecaller,
         hidden_features=args.hidden_features,
+        length_head_mode=args.length_head_mode,
         dropout=args.dropout,
     ).to(device)
-    weights = PolyLossWeights(
-        lambda_location=args.lambda_location,
-        lambda_length=args.lambda_length,
-        lambda_status=args.lambda_status,
-    )
     criterion = PolyAuxiliaryLoss(weights)
     optimizer = create_optimizer(
         model,
@@ -186,6 +205,8 @@ def run(args: argparse.Namespace) -> int:
             model=model,
             optimizer=optimizer,
             device=device,
+            data_order_seed=args.data_order_seed,
+            loss_weights=weights,
         )
         start_epoch = resume_state.epoch
         global_step = resume_state.global_step
@@ -195,6 +216,15 @@ def run(args: argparse.Namespace) -> int:
                 f"epochs {args.epochs}"
             )
 
+    _validate_epoch_checkpoint_paths(
+        checkpoint_path,
+        start_epoch=start_epoch,
+        epochs=args.epochs,
+        data_root=data_root,
+        work_root=work_root,
+        protected_paths=(manifest_path, loss_log_path),
+    )
+
     project_root = Path(__file__).resolve().parents[3]
     context = CheckpointContext(
         random_seed=args.random_seed,
@@ -203,8 +233,11 @@ def run(args: argparse.Namespace) -> int:
         manifest_schema_version=_single_manifest_version(records),
         loss_weights=weights,
         git_commit=_git_commit(project_root),
+        data_order_seed=args.data_order_seed,
     )
     for epoch in range(start_epoch + 1, args.epochs + 1):
+        if shuffle_generator is not None:
+            shuffle_generator.manual_seed(args.data_order_seed + epoch)
         train_result = train_one_epoch(
             model,
             train_loader,
@@ -224,12 +257,19 @@ def run(args: argparse.Namespace) -> int:
             global_step=global_step,
             progress_desc=f"Epoch {epoch}/{args.epochs} validation",
         )
-        append_loss_log(loss_log_path, train_result, epoch=epoch, split="train")
+        append_loss_log(
+            loss_log_path,
+            train_result,
+            epoch=epoch,
+            split="train",
+            loss_weights=weights,
+        )
         append_loss_log(
             loss_log_path,
             validation_result,
             epoch=epoch,
             split="validation",
+            loss_weights=weights,
         )
         save_checkpoint(
             checkpoint_path,
@@ -239,6 +279,8 @@ def run(args: argparse.Namespace) -> int:
             global_step=global_step,
             context=context,
             data_root=data_root,
+            work_root=work_root,
+            archive_epoch=True,
         )
         print(
             json.dumps(
@@ -255,6 +297,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 def _validate_arguments(args: argparse.Namespace) -> None:
+    if args.data_order_seed is not None and args.data_order_seed < 0:
+        raise ValueError("data_order_seed must be non-negative")
     if args.device != "cuda:0":
         raise ValueError(
             "device must be cuda:0; select the physical GPU with CUDA_VISIBLE_DEVICES"
@@ -311,7 +355,15 @@ def _validate_paths(
     for output_path, label in (
         (checkpoint_path, "checkpoint"),
         (loss_log_path, "loss log"),
+        *(
+            (path.resolve(), "epoch checkpoint")
+            for path in _epoch_checkpoints(checkpoint_path)
+        ),
     ):
+        if output_path == manifest_path:
+            raise ValueError(f"{label} must not overwrite the manifest")
+        if label == "epoch checkpoint" and output_path == loss_log_path:
+            raise ValueError("epoch checkpoint must not overwrite the loss log")
         if output_path == data_root or output_path.is_relative_to(data_root):
             raise ValueError(f"{label} must not be inside data_root: {output_path}")
         if output_path != work_root and not output_path.is_relative_to(work_root):
@@ -394,12 +446,64 @@ def _validate_output_state(
                 f"cannot resume because checkpoint does not exist: {checkpoint_path}"
             )
         return
-    existing = [path for path in (checkpoint_path, loss_log_path) if path.exists()]
+    archives = _epoch_checkpoints(checkpoint_path)
+    existing = [
+        path for path in (checkpoint_path, loss_log_path, *archives) if path.exists()
+    ]
     if existing and not overwrite:
         raise ValueError(
             "training output already exists; use --resume or --overwrite: "
             + ", ".join(str(path) for path in existing)
         )
+    if overwrite:
+        if any(not path.is_file() for path in archives):
+            raise ValueError("epoch checkpoint output must be a regular file")
+        for path in archives:
+            path.unlink()
+
+
+def _epoch_checkpoints(checkpoint_path: Path) -> list[Path]:
+    """Find only this checkpoint's numbered snapshots, excluding other outputs."""
+    pattern = re.compile(
+        re.escape(checkpoint_path.stem)
+        + r"\.epoch_[0-9]{4,}"
+        + re.escape(checkpoint_path.suffix)
+    )
+    if not checkpoint_path.parent.is_dir():
+        return []
+    return sorted(
+        path
+        for path in checkpoint_path.parent.iterdir()
+        if pattern.fullmatch(path.name)
+    )
+
+
+def _validate_epoch_checkpoint_paths(
+    checkpoint_path: Path,
+    *,
+    start_epoch: int,
+    epochs: int,
+    data_root: Path,
+    work_root: Path,
+    protected_paths: Sequence[Path] = (),
+) -> None:
+    """Reject snapshot collisions and unsafe paths before any epoch is trained."""
+    for epoch in range(start_epoch + 1, epochs + 1):
+        archive = epoch_checkpoint_path(checkpoint_path, epoch)
+        for path in (archive, archive.with_suffix(archive.suffix + ".tmp")):
+            resolved = path.resolve()
+            if resolved.is_relative_to(data_root):
+                raise ValueError(
+                    f"epoch checkpoint must not be inside data_root: {path}"
+                )
+            if not resolved.is_relative_to(work_root):
+                raise ValueError(f"epoch checkpoint must be inside work_root: {path}")
+            if resolved in protected_paths:
+                raise ValueError(
+                    f"epoch checkpoint must not overwrite an input/log: {path}"
+                )
+        if archive.exists() or archive.is_symlink():
+            raise FileExistsError(f"epoch checkpoint already exists: {archive}")
 
 
 def _single_manifest_version(records: Sequence[PolyTrainingRecord]) -> str:

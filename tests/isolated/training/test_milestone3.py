@@ -131,9 +131,14 @@ def test_holypoly_model_freezes_bonito_and_optimizer_uses_only_heads() -> None:
     assert counts["total"] == counts["frozen"] + counts["trainable"]
 
 
-def test_independent_loss_masks_failure_padding_and_invalid_lengths() -> None:
+@pytest.mark.parametrize("length_loss", ["log_smooth_l1", "mae", "huber"])
+def test_independent_loss_masks_failure_padding_and_invalid_lengths(
+    length_loss: str,
+) -> None:
     model = HolypolyModel(tiny_v5_basecaller(), hidden_features=16)
-    criterion = PolyAuxiliaryLoss(PolyLossWeights(2.0, 3.0, 4.0))
+    criterion = PolyAuxiliaryLoss(
+        PolyLossWeights(2.0, 3.0, 4.0, length_loss=length_loss)
+    )
     batch = _synthetic_batch()
     losses, _ = _losses_on_batch(model, criterion, batch, torch.device("cpu"))
 
@@ -283,6 +288,8 @@ def test_synthetic_overfit_and_checkpoint_roundtrip(tmp_path: Path) -> None:
         "lambda_location": 1.0,
         "lambda_length": 1.0,
         "lambda_status": 1.0,
+        "length_loss": "log_smooth_l1",
+        "huber_delta_nt": 10.0,
     }
     assert payload["python_version"]
     assert payload["pytorch_version"]

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Self, cast
 
 from torch import Tensor, nn
 
+from holypoly.models.length_head_config import validate_length_head_mode
 from holypoly.models.poly_heads import BonitoMultiTaskOutput, BonitoV5MultiTaskModel
 
 
@@ -22,12 +23,19 @@ class HolypolyModel(nn.Module):
         dropout: float = 0.0,
         freeze_encoder: bool = True,
         freeze_basecalling_head: bool = True,
+        length_head_mode: str = "mean",
     ) -> None:
         super().__init__()
+        self.head_config = {
+            "length_head_mode": validate_length_head_mode(length_head_mode),
+            "hidden_features": hidden_features,
+            "dropout": dropout,
+        }
         self.multitask = BonitoV5MultiTaskModel(
             basecaller,
             hidden_features=hidden_features,
             dropout=dropout,
+            length_head_mode=length_head_mode,
         )
         self.freeze_encoder = freeze_encoder
         self.freeze_basecalling_head = freeze_basecalling_head
@@ -95,6 +103,22 @@ class HolypolyModel(nn.Module):
             if crf is None:
                 raise TypeError("Bonito v5 encoder must expose crf")
             crf.requires_grad_(False)
+
+
+def head_config_from_checkpoint(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Restore explicit head architecture, defaulting legacy checkpoints to mean."""
+    if "head_config" in payload:
+        config = dict(payload["head_config"])
+        validate_length_head_mode(config["length_head_mode"])
+        return config
+    state = payload["model_state_dict"]
+    return {
+        "length_head_mode": "mean",
+        "hidden_features": state["multitask.length_head.length_regressor.weight"].shape[
+            1
+        ],
+        "dropout": 0.0,
+    }
 
 
 def load_bonito_v5_model(

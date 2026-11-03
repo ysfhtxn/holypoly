@@ -21,7 +21,11 @@ import torch
 from tqdm import tqdm
 
 from holypoly.core.config import load_config
-from holypoly.models.model import HolypolyModel, load_bonito_v5_model
+from holypoly.models.model import (
+    HolypolyModel,
+    head_config_from_checkpoint,
+    load_bonito_v5_model,
+)
 from holypoly.models.poly_heads import ReadStatus, decode_location_intervals
 from holypoly.training.data import (
     ManifestLabelStatus,
@@ -45,7 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="New directory: results/training_evaluation/<run>/<split>-<tag>",
+    )
     parser.add_argument("--split", choices=["test", "validation"], default="test")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
@@ -97,6 +106,9 @@ def _empty_prediction(record: PolyTrainingRecord) -> dict[str, Any]:
         "length_head_status": "",
         "shared_status": "",
         "shared_status_confidence": None,
+        "shared_poly_present_probability": None,
+        "shared_zero_nt_probability": None,
+        "shared_failure_probability": None,
         "predicted_start_sample": None,
         "predicted_end_sample": None,
         "prediction_status": "input_failure",
@@ -157,6 +169,15 @@ def predict_reads(
                 length_head_status=ReadStatus(length_statuses[position]).name.lower(),
                 shared_status=ReadStatus(status).name.lower(),
                 shared_status_confidence=float(probabilities[position, status]),
+                shared_poly_present_probability=float(
+                    probabilities[position, int(ReadStatus.POLY_PRESENT)]
+                ),
+                shared_zero_nt_probability=float(
+                    probabilities[position, int(ReadStatus.ZERO_NT)]
+                ),
+                shared_failure_probability=float(
+                    probabilities[position, int(ReadStatus.FAILURE)]
+                ),
                 prediction_status="ok",
             )
             interval = intervals[position]
@@ -264,6 +285,49 @@ def agreement_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def status_agreement_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Compare shared argmax status with weak labels; input failures stay separate.
+
+    Failure predictions on labeled positives/zeros are reported separately from
+    false positives/negatives. No gating is applied to raw length metrics.
+    """
+    classes = [status.name.lower() for status in ReadStatus]
+    confusion = {target: dict.fromkeys(classes, 0) for target in classes}
+    for row in rows:
+        if row["prediction_status"] == "ok" and row["label_status"] in confusion:
+            confusion[row["label_status"]][row["shared_status"]] += 1
+    zeros = sum(confusion["zero_nt"].values())
+    positives = sum(confusion["poly_present"].values())
+    total = sum(sum(counts.values()) for counts in confusion.values())
+    return {
+        "label_source": "manifest_label_status_weak_supervision",
+        "decision_rule": "argmax_of_averaged_head_logits; no_length_gating",
+        "confusion_true_rows_predicted_columns": confusion,
+        "evaluable_reads": total,
+        "input_or_prediction_failures": sum(
+            row["prediction_status"] != "ok" for row in rows
+        ),
+        "accuracy": sum(confusion[c][c] for c in classes) / total if total else None,
+        "zero_nt_reads": zeros,
+        "zero_nt_false_positive_fraction": (
+            confusion["zero_nt"]["poly_present"] / zeros if zeros else None
+        ),
+        "zero_nt_predicted_failure_fraction": (
+            confusion["zero_nt"]["failure"] / zeros if zeros else None
+        ),
+        "poly_present_reads": positives,
+        "poly_present_false_zero_fraction": (
+            confusion["poly_present"]["zero_nt"] / positives if positives else None
+        ),
+        "poly_present_recall": (
+            confusion["poly_present"]["poly_present"] / positives if positives else None
+        ),
+        "poly_present_predicted_failure_fraction": (
+            confusion["poly_present"]["failure"] / positives if positives else None
+        ),
+    }
+
+
 def _write_table(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     """Write TSV, preserving unknown/nonfinite values as empty cells."""
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -343,7 +407,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "Training-target agreement only; construct nominal lengths and provisional "
             "boundaries are not independent per-read truth. Same-batch held-out reads "
             "do not establish cross-batch generalization. length_only labels do not "
-            "supervise location or status. Raw regression drives length metrics; "
+            "supervise location; status is ignored unless joint_config explicitly "
+            "enables weak status supervision. No failure-detection ability is "
+            "established without labeled failure examples. "
+            "Raw regression drives length metrics; "
             "decoded_length_nt uses the length head status, while shared_status and "
             "interval decoding use averaged head logits."
         ),
@@ -377,10 +444,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("manifest schema differs from the checkpoint")
     set_random_seed(int(payload["random_seed"]))
     state = payload["model_state_dict"]
-    hidden_features = state["multitask.length_head.length_regressor.weight"].shape[1]
+    head_config = head_config_from_checkpoint(payload)
     model = HolypolyModel(
         load_bonito_v5_model(paths.bonito_model, device=str(device)),
-        hidden_features=hidden_features,
+        **head_config,
     ).to(device)
     model.load_state_dict(state, strict=True)
     reader = Pod5SignalReader(
@@ -416,6 +483,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         bonito_commit=payload["bonito_commit"],
         model_config=model_config,
         loss_config=payload["loss_config"],
+        head_config=head_config,
+        joint_config=payload.get("joint_config"),
+        data_order_seed=payload.get("data_order_seed"),
         manifest_schema_version=payload["manifest_schema_version"],
         python_version=sys.version,
         pytorch_version=torch.__version__,
@@ -423,6 +493,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         gpu=torch.cuda.get_device_name(0),
         command=sys.argv,
     )
+    if (payload.get("joint_config") or {}).get("status_supervision"):
+        summary["status_metrics"] = status_agreement_metrics(rows)
+        summary["status_metrics_by_nominal_length"] = {
+            str(length): status_agreement_metrics(
+                [row for row in rows if row["nominal_length_nt"] == length]
+            )
+            for length in sorted({row["nominal_length_nt"] for row in rows})
+        }
     output_dir.mkdir(parents=True)
     _write_table(output_dir / "predictions.tsv", rows)
     _write_table(output_dir / "metrics_by_group.tsv", group_metrics)

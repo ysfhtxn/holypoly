@@ -27,6 +27,7 @@ from holypoly.training.evaluate import (
     agreement_metrics,
     main,
     predict_reads,
+    status_agreement_metrics,
 )
 from tests.isolated.helpers import tiny_v5_basecaller
 from tests.isolated.training.test_command import FIELDNAMES, _row
@@ -106,6 +107,14 @@ def test_predict_preserves_failures_and_never_updates_parameters(
         torch.equal(value, before[key]) for key, value in model.state_dict().items()
     )
     for record, row in zip(records[:3], rows[:3], strict=True):
+        assert sum(
+            row[key]
+            for key in (
+                "shared_poly_present_probability",
+                "shared_zero_nt_probability",
+                "shared_failure_probability",
+            )
+        ) == pytest.approx(1)
         assert row["regression_length_nt"] >= 0
         assert row["model_input_samples"] == 120
         assert row["head_excluded"] == head_free
@@ -129,6 +138,38 @@ def _metric_row(target: float, prediction: float | None, **overrides: object) ->
         "shared_status": "poly_present",
         **overrides,
     }
+
+
+def test_status_metrics_keep_failures_separate_and_do_not_gate_regression() -> None:
+    rows = [
+        _metric_row(0, 40, label_status="zero_nt", shared_status="zero_nt"),
+        _metric_row(0, 50, label_status="zero_nt", shared_status="poly_present"),
+        _metric_row(0, 60, label_status="zero_nt", shared_status="failure"),
+        _metric_row(20, 20),
+        _metric_row(20, 20, shared_status="zero_nt"),
+        _metric_row(20, 20, shared_status="failure"),
+        _metric_row(20, None, prediction_status="input_failure", shared_status=""),
+    ]
+    metrics = status_agreement_metrics(rows)
+    assert metrics["zero_nt_false_positive_fraction"] == pytest.approx(1 / 3)
+    assert metrics["poly_present_false_zero_fraction"] == pytest.approx(1 / 3)
+    assert metrics["poly_present_recall"] == pytest.approx(1 / 3)
+    assert metrics["zero_nt_predicted_failure_fraction"] == pytest.approx(1 / 3)
+    assert metrics["accuracy"] == pytest.approx(2 / 6)
+    assert metrics["input_or_prediction_failures"] == 1
+    assert metrics["confusion_true_rows_predicted_columns"]["failure"] == {
+        "poly_present": 0,
+        "zero_nt": 0,
+        "failure": 0,
+    }
+    assert agreement_metrics(rows)["mae_nt"] == 25
+    assert status_agreement_metrics([])["accuracy"] is None
+    assert (
+        status_agreement_metrics([_metric_row(20, 20)])[
+            "zero_nt_false_positive_fraction"
+        ]
+        is None
+    )
 
 
 def test_agreement_metrics_include_zero_and_exclude_failed_or_unknown_targets() -> None:
@@ -232,8 +273,9 @@ def test_evaluation_dry_run_loads_no_checkpoint_or_signal(
     assert "outside raw data" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("mode", ["mean", "sum", "duration_only", "mean_duration"])
 def test_evaluation_exports_test_only_and_restores_checkpoint_hidden_size(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     """Exercise checkpoint loading and all outputs using CPU synthetic inputs."""
     for name in (
@@ -253,7 +295,9 @@ def test_evaluation_exports_test_only_and_restores_checkpoint_hidden_size(
     model_dir = work_root / "model"
     model_dir.mkdir(parents=True)
     (model_dir / "config.toml").write_text("[standardisation]\nmean=0\nstdev=1\n")
-    model = HolypolyModel(tiny_v5_basecaller(), hidden_features=16)
+    model = HolypolyModel(
+        tiny_v5_basecaller(), hidden_features=16, length_head_mode=mode
+    )
     checkpoint = work_root / "checkpoint.pt"
     torch.save(
         {
@@ -266,6 +310,7 @@ def test_evaluation_exports_test_only_and_restores_checkpoint_hidden_size(
             "git_commit": "synthetic",
             "bonito_commit": "synthetic",
             "loss_config": {},
+            **({"head_config": model.head_config} if mode != "mean" else {}),
         },
         checkpoint,
     )
@@ -339,5 +384,6 @@ def test_evaluation_exports_test_only_and_restores_checkpoint_hidden_size(
     assert rows[1]["regression_length_nt"] == ""
     assert summary["epoch"] == 3 and summary["metrics"]["evaluable_reads"] == 1
     assert summary["metrics"]["prediction_failures"] == 1
+    assert summary["head_config"]["length_head_mode"] == mode
     assert (output / "metrics_by_group.tsv").is_file()
     assert checkpoint.read_bytes() == before

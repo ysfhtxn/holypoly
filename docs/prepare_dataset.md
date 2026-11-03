@@ -1,5 +1,8 @@
 # 构建级弱监督训练集
 
+> 已确认无 flank 的 head–Poly 构建请使用 [v4 制作方法](prepare_dataset_v4.md)。
+> 下方原有命令和双锚点规则说明的是 v3 历史流程。
+
 脚本：`src/holypoly/datasets/prepare.py`。在 Bonito 独立环境运行，无新增依赖，
 不加载模型、不使用 GPU、不修改原始文件。
 
@@ -41,6 +44,73 @@ stdout 仍仅输出最终 JSON，便于重定向。
 CPU 内存取决于 UUID 和合格候选数，百万 read 预计需要数 GB；HDD 可能需要数十分钟
 至数小时，尚未实测。manifest 通常数 MB，完整 UUID 审计表可能数百 MB。
 脚本在读取前打印资源提示。本次实现没有执行完整扫描。
+
+### 暂时只使用 polyA 正样本
+
+在原制作命令中添加 `--poly-types polyA`，并使用新的输出目录。例如：
+
+```bash
+PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare \
+  --config configs/local.yaml \
+  --bonito-bam basecalls/poly2p5per/basecalls.bam \
+  --dorado-bam dorado_calls/poly2p5per/dorado_basecalls.bam \
+  --pod5-dir pod5/poly2p5per \
+  --reference fixed_len_ref.fa \
+  --output-dir metadata/poly2p5per-head-free-v3-polyA-6000pergroup \
+  --max-records 0 \
+  --per-group 6000 \
+  --stop-when-full \
+  --poly-types polyA
+```
+
+默认仍选取 `polyA polyT`；也可传 `--poly-types polyT`。
+该选项只改变最终训练样本的筛选，在均衡前排除未请求的正样本类型，所以 polyT
+稀缺不再限制 polyA 数量。各请求的正长度/类型组仍取共同最少数量，并受
+`--per-group` 上限限制；合格 0 nt 样本仍保留，数量至多为一个正样本组的数量。
+0 nt 保持 `poly_type=none`，不因本选项筛选方向，可能包含 forward 和 reverse。
+
+flank 推定、跨长度质控、head 排除及 full/length_only 判定保持原规则，仍使用
+两方向候选作为标签质控证据。完整扫描量并未因此减少，不能直接从旧 manifest
+得到未被采样的候选。标签仍为构建标称弱监督；此选项不保证增加 full 样本比例。
+只使用 polyA 训练后，polyT 没有正样本监督，不能宣称模型已验证 polyT 能力。
+
+`summary.arguments.poly_types` 记录请求的类型；`eligible_counts` 仍记录筛选前
+全部合格候选，`excluded_poly_type_counts` 单独记录因类型排除的候选。
+对应 audit 状态为 `not_selected_poly_type`。`missing_positive_strata` 只检查
+请求的类型，不把主动排除的 polyT 报成缺失。重新制作后应从新 checkpoint 和
+日志路径开始训练，以免混淆双方向模型与单方向实验。
+
+### 达到配额后停止边界和 POD5 元数据检查
+
+可在上述命令中追加 `--stop-when-full`，并使用新的输出目录，例如
+`metadata/poly2p5per-head-free-v3-polyA-6000pergroup-quota`。
+默认不启用此选项，仍在扫描范围内的全部合格候选中按种子随机采样。
+
+启用后，第三阶段只在以下条件全部满足时暂停昂贵的边界和 POD5 元数据检查：
+
+- 每个参考正长度与请求的 `--poly-types` 组合都已有至少 `--per-group` 条
+  合格候选；full 和 length_only 都计入，不要求全为 full。
+- 参考中存在 0 nt 时，也已收集至少 `--per-group` 条合格 0 nt 候选。
+- provisional flank 通过原有跨长度质控：至少两个正长度、总支持不少于
+  `--min-flank-reads`。即使训练只选 polyA，polyT 仍可提供 flank 质控证据。
+
+剩余 Dorado BAM 仍顺序做轻量 primary UUID 检查，不再解析 head/flank/move 或
+查询 POD5 元数据。这样可以发现文件后段的重复 primary 并剔除之前收集的候选；
+若因此使配额或 flank 支持不足，会恢复边界和 POD5 检查，直到再次满足条件。
+若某组始终不足、flank 质控未通过或重复无法补足，就按原规则处理到
+`--max-records` 上限或 EOF，最后按实际可用数量均衡。不会补造样本或放宽标签。
+第一阶段 Bonito 构建冲突检查仍执行到扫描上限，第二阶段仍至多取 200 个
+flank 候选。本选项减少的是边界计算和 POD5 查询，不保证减少 BAM 顺序读取量。
+
+暂停后的未检查 primary 在 audit 中标为 `not_evaluated_quota_met`，不能解释为
+质量检查失败。summary 的 `metadata_collection` 记录是否达到配额、最终配额
+是否满足、检查/跳过的记录数、恢复收集次数和 UUID 检查范围；`eligible_counts`、
+`excluded_poly_type_counts` 和 flank 支持数只统计实际检查过的候选。
+
+这一模式从 BAM 顺序靠前的候选（必要时加上恢复收集的片段）中随机划分，
+**不是在完整数据集上均匀随机采样**。固定种子不能消除文件顺序或批次偏差，
+只能保证同样输入下的划分可重复。summary 会记录该限制。建议用于快速开发，
+独立验证或正式评估仍应审视采样设计。
 
 ## 输入定义与算法
 
@@ -161,7 +231,7 @@ CUDA_VISIBLE_DEVICES=<physical-gpu-id> PYTHONPATH=src \
 
 该测试读取各 split 的真实 POD5，检查混合监督 forward/backward、冻结 encoder
 与 CRF 的权重和梯度、原 basecall 输出接口、优化器恢复及重复推理一致性，并在
-`<work_root>/results/<checkpoint-directory-name>/` 写入 `pipeline_checks.json` 和
+`<work_root>/results/training_evaluation/<checkpoint-directory-name>/` 写入 `pipeline_checks.json` 和
 `test_predictions.tsv`。test split 只导出预测，不进行 optimizer 更新。
 缺少外部路径时明确跳过；必须只暴露一个 GPU。Torch、Triton、CUDA 的运行缓存
 也应通过对应环境变量指向 work root 的 cache 子目录。

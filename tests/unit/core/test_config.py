@@ -7,6 +7,24 @@ from holypoly.core.config import ConfigError, load_config
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
+@pytest.mark.parametrize("mode", ["mean", "sum", "duration_only", "mean_duration"])
+def test_optional_length_head_configuration(tmp_path: Path, mode: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"training:\n  length_head_mode: {mode}\n  data_order_seed: 17\n"
+    )
+    config = load_config(config_path, environ={})
+    assert config.training.length_head_mode == mode
+    assert config.training.data_order_seed == 17
+
+
+def test_unknown_length_head_configuration_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("training:\n  length_head_mode: unknown\n")
+    with pytest.raises(ConfigError, match="length_head_mode"):
+        load_config(config_path, environ={})
+
+
 def _write_default(path: Path, data_root: Path, work_root: Path) -> None:
     path.write_text(
         f"""
@@ -40,6 +58,40 @@ def test_repository_defaults_do_not_embed_machine_paths() -> None:
     assert config.training.manifest_path is None
     assert config.training.bonito_model is None
     assert config.training.checkpoint_path is None
+    assert config.training.length_head_mode == "mean"
+    assert config.auxiliary_loss.length_loss == "log_smooth_l1"
+    assert config.auxiliary_loss.huber_delta_nt == 10
+
+
+@pytest.mark.parametrize("mode", ["log_smooth_l1", "mae", "huber"])
+def test_length_loss_configuration(tmp_path: Path, mode: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"model:\n  auxiliary_loss:\n    length_loss: {mode}\n    huber_delta_nt: 7.5\n"
+    )
+    config = load_config(config_path, environ={})
+    assert config.auxiliary_loss.length_loss == mode
+    assert config.auxiliary_loss.huber_delta_nt == 7.5
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "length_loss: unknown",
+        "length_loss: null",
+        "huber_delta_nt: 0",
+        "huber_delta_nt: -1",
+        "huber_delta_nt: .nan",
+        "huber_delta_nt: .inf",
+        "huber_delta_nt: true",
+        "lambda_length: .nan",
+    ],
+)
+def test_invalid_length_loss_configuration(tmp_path: Path, setting: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"model:\n  auxiliary_loss:\n    {setting}\n")
+    with pytest.raises(ConfigError):
+        load_config(config_path, environ={})
 
 
 def test_path_precedence(tmp_path: Path) -> None:

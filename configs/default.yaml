@@ -19,6 +19,8 @@ model:
     lambda_location: 1.0
     lambda_length: 1.0
     lambda_status: 1.0
+    length_loss: log_smooth_l1
+    huber_delta_nt: 10.0
 
 training:
   manifest_path: null
@@ -29,6 +31,7 @@ training:
   batch_size: 1
   chunk_size_samples: 12000
   hidden_features: 128
+  length_head_mode: mean
   dropout: 0.0
   learning_rate: 0.001
   weight_decay: 0.0

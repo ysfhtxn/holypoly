@@ -50,7 +50,7 @@ class ManifestLabelStatus(StrEnum):
 
 
 class ManifestSupervisionMode(StrEnum):
-    """Length-only weak labels do not supervise location or read status."""
+    """Length-only labels ignore location/status unless status is opted in."""
 
     FULL = "full"
     LENGTH_ONLY = "length_only"
@@ -301,8 +301,14 @@ def load_training_manifest(path: Path) -> tuple[PolyTrainingRecord, ...]:
 
 def collate_poly_training_examples(
     examples: Sequence[PolyTrainingExample],
+    *,
+    supervise_status: bool = False,
 ) -> PolyTrainingBatch:
-    """Collate fixed inputs with suffix padding and raw-coordinate Poly labels."""
+    """Collate inputs; optionally use manifest status independently of location.
+
+    Opting in does not upgrade weak construct labels to read-level truth, change
+    length targets, or enable location labels for length-only records.
+    """
     if not examples:
         raise ValueError("cannot collate an empty training batch")
     chunk_size_samples = examples[0].signal.shape[0]
@@ -348,7 +354,10 @@ def collate_poly_training_examples(
             dtype=torch.float32,
         ),
         status_targets=torch.tensor(
-            [_read_status(example.record) for example in examples],
+            [
+                _read_status(example.record, supervise_status=supervise_status)
+                for example in examples
+            ],
             dtype=torch.long,
         ),
         read_ids=tuple(example.record.read_id for example in examples),
@@ -384,8 +393,11 @@ def _location_targets_for_record(
     )
 
 
-def _read_status(record: PolyTrainingRecord) -> int:
-    if record.supervision_mode is ManifestSupervisionMode.LENGTH_ONLY:
+def _read_status(record: PolyTrainingRecord, *, supervise_status: bool = False) -> int:
+    if (
+        record.supervision_mode is ManifestSupervisionMode.LENGTH_ONLY
+        and not supervise_status
+    ):
         return LOCATION_IGNORE_INDEX
     return {
         ManifestLabelStatus.POLY_PRESENT: int(ReadStatus.POLY_PRESENT),
@@ -471,10 +483,12 @@ def _validate_record(record: PolyTrainingRecord, context: str) -> None:
     ):
         raise ValueError(f"{context}: invalid model_input_samples for real chunk")
     if (
-        record.manifest_version == "construct-nominal-head-excluded-v3"
+        record.manifest_version
+        in {"construct-nominal-head-excluded-v3", "construct-nominal-head-poly-v4"}
         and not record.head_excluded
     ):
-        raise ValueError(f"{context}: v3 requires head_excluded=true")
+        version = "v4" if record.manifest_version.endswith("v4") else "v3"
+        raise ValueError(f"{context}: {version} requires head_excluded=true")
     if record.head_excluded:
         boundary = record.head_boundary_sample
         if (
@@ -493,6 +507,38 @@ def _validate_record(record: PolyTrainingRecord, context: str) -> None:
             and record.chunk_end_sample > boundary
         ):
             raise ValueError(f"{context}: chunk includes signal on the head side")
+
+    if record.manifest_version == "construct-nominal-head-poly-v4":
+        if (
+            record.supervision_mode is not ManifestSupervisionMode.LENGTH_ONLY
+            or record.poly_start_sample is not None
+            or record.poly_end_sample is not None
+            or record.poly_is_complete is not None
+            or not math.isnan(record.observed_sequence_length_nt)
+            or record.label_source != "construct_nominal_weak_supervision"
+            or not math.isfinite(record.true_length_nt)
+            or record.true_length_nt < 0
+            or record.true_length_nt != record.nominal_length_nt
+            or record.failure_reason
+        ):
+            raise ValueError(
+                f"{context}: v4 length_only requires a non-negative nominal weak "
+                "target with unknown Poly bounds, completeness and observed length"
+            )
+        if record.true_length_nt == 0:
+            if (
+                record.label_status is not ManifestLabelStatus.ZERO_NT
+                or record.poly_type is not ManifestPolyType.NONE
+            ):
+                raise ValueError(f"{context}: v4 zero length requires zero_nt/none")
+        elif (
+            record.label_status is not ManifestLabelStatus.POLY_PRESENT
+            or record.poly_type is ManifestPolyType.NONE
+        ):
+            raise ValueError(
+                f"{context}: v4 positive length requires poly_present/polyA/T"
+            )
+        return
 
     if record.label_status is ManifestLabelStatus.POLY_PRESENT:
         if record.poly_type is ManifestPolyType.NONE:

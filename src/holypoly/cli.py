@@ -9,12 +9,14 @@ from pathlib import Path
 
 from holypoly.core.config import ConfigError, load_config
 from holypoly.core.doctor import render_report, run_doctor
+from holypoly.models.length_head_config import LENGTH_HEAD_MODES
 from holypoly.training.launcher import (
     TrainingLaunchError,
     apply_training_overrides,
     launch_training,
     render_launch_error,
 )
+from holypoly.training.loss_config import LENGTH_LOSS_MODES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--batch-size", type=int)
     train_parser.add_argument("--chunk-size-samples", type=int)
     train_parser.add_argument("--hidden-features", type=int)
+    train_parser.add_argument("--length-head-mode", choices=LENGTH_HEAD_MODES)
+    train_parser.add_argument("--data-order-seed", type=int)
+    train_parser.add_argument(
+        "--length-loss", choices=LENGTH_LOSS_MODES, help="Length regression objective."
+    )
+    train_parser.add_argument(
+        "--huber-delta-nt", type=float, help="Positive Huber transition in raw nt."
+    )
     train_parser.add_argument("--dropout", type=float)
     train_parser.add_argument("--learning-rate", type=float)
     train_parser.add_argument("--weight-decay", type=float)
@@ -118,6 +128,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 chunk_size_samples=args.chunk_size_samples,
                 hidden_features=args.hidden_features,
+                length_head_mode=args.length_head_mode,
+                data_order_seed=args.data_order_seed,
                 dropout=args.dropout,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
@@ -128,7 +140,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             from dataclasses import replace
 
-            config = replace(config, training=training)
+            loss_overrides = {
+                name: value
+                for name, value in (
+                    ("length_loss", args.length_loss),
+                    ("huber_delta_nt", args.huber_delta_nt),
+                )
+                if value is not None
+            }
+            config = replace(
+                config,
+                training=training,
+                auxiliary_loss=replace(config.auxiliary_loss, **loss_overrides),
+            )
             project_root = Path(__file__).resolve().parents[2]
             return launch_training(
                 config,

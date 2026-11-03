@@ -1,8 +1,12 @@
 # holypoly
 
 `holypoly` 用于整理 Oxford Nanopore cDNA 数据，并为后续 poly(A/T) 区域定位和
-长度估计提供工具。本阶段只包含项目初始化与外部数据环境体检，不执行 basecalling、
-GPU 任务、模型训练或完整原始信号读取。
+长度估计提供工具。当前支持弱监督数据制作、Bonito v5 辅助 head、单 GPU
+联合训练和小规模验证。
+
+当前默认流程见 [数据制作与三项联合训练](docs/default_workflow.md)：
+先制作 v4 长度/状态 manifest，再生成匹配的 reference-head 序列 manifest；
+新训练使用 sum pooling + Huber，以及 length、status、basecalling 三项 loss。
 
 ## 代码与测试组织
 
@@ -33,6 +37,18 @@ CLI 与训练启动器仍可在父项目环境运行。原平铺模块的 Python
 训练后导出 test split 预测、分组指标及调用训练汇总绘图脚本，见
 [训练、测试与绘图流程](docs/evaluate_model.md)。
 常用命令速查见 [常用命令](docs/common_commands.md)。
+
+新结果按用途分目录：训练验证/测试位于 `results/training_evaluation/<run>/`，
+实际 POD5 预测位于 `results/cdna_prediction/<experiment>/`，
+多工具对比位于 `results/tool_comparison/<comparison>/`。历史结果默认保留原位，
+目录与命名规则见 [结果目录约定](docs/result_layout.md)。
+
+参考 head 序列监督、sum/Huber 与原生 CTC-CRF 联合训练，见
+[联合训练说明](docs/reference_joint_training.md)。`scripts/run_reference_joint.sh`
+及 `joint_command` 默认联合训练 length、弱 status 和 basecalling，location 不监督。
+历史冻结训练入口保留用于旧实验和明确指定的对照。
+针对 0 nt 假阳性的独立验证，见[冻结状态分类训练](docs/status_calibration.md)：
+冻结 encoder、投影和长度回归，只对现有 status 分类器做类别平衡训练。
 
 根目录 pytest 运行 `unit/`，并通过 subprocess 在 `src/bonito/.venv` 中运行
 `isolated/`。也可单独执行：
@@ -141,7 +157,13 @@ Torch 和 Bonito 依赖安装到 holypoly 的 `.venv`。
 ## 辅助 head 训练数据接口
 
 从 Bonito save-ctc BAM、Dorado move table 和 POD5 生成均衡训练 manifest：
-参见 [数据准备脚本与运行说明](docs/prepare_dataset.md)。脚本使用构建标称长度
+已确认无 flank 的 head–Poly 构建使用 [v4 制作方法](docs/prepare_dataset_v4.md)：
+取消 flank 推定，正样本和 0 nt 均使用标称长度弱监督，定位/状态保持无监督。
+联合均衡制作可显式使用 `--poly-types polyA polyT --strict-balance`：
+正长度 × 类型与 0 nt 两方向均取相同数量，按最稀缺组缩减；
+小型 200 条/组示例及状态比例说明见 [v4 制作方法](docs/prepare_dataset_v4.md)。
+旧 polyA、0 nt 和配额暂停方案见 [v3 历史制作方法](docs/current_dataset_preparation.md)。
+历史 v3 参见 [数据准备脚本与运行说明](docs/prepare_dataset.md)：使用构建标称长度
 弱监督，从 0A 推定 provisional flank，保留失败审计，不复制原始信号。
 边界不确定的正构建可使用 `supervision_mode=length_only` 训练标称长度，
 同时跳过定位和状态 loss；旧 manifest 没有该字段时默认完整监督。
@@ -173,6 +195,13 @@ signal shift/scale。它不裁剪、修改或写入 POD5。Torch 相关测试继
 Transformer、upsample 和原 CRF head，仅让 location/length 两个 Poly head 参与
 优化。`src/holypoly/training/losses.py` 提供独立的 masked auxiliary loss，
 `src/holypoly/training/engine.py` 提供单 GPU epoch、验证、指标、日志和 checkpoint 恢复。
+
+训练长度 loss 可通过 `--length-loss log_smooth_l1|mae|huber` 选择，默认保持原定义；
+Huber 的 `--huber-delta-nt` 默认 10。配置、公式和对照命令见
+[长度 loss 说明](docs/length_losses.md)。不同 loss 的对照应新建实验目录。
+
+平均池化与求和池化的独立对照使用 `scripts/run_length_pooling_ablation.sh`，
+默认固定 Huber、batch 8、20 轮，见[池化对照说明](docs/length_pooling_ablation.md)。
 
 真实 smoke manifest 必须放在外部 work root，并分别记录构建标称长度、Dorado
 观察长度和实际训练目标。当前 2p5per smoke 使用构建级 20 nt 弱监督与 provisional
@@ -209,6 +238,12 @@ uv run holypoly train --epochs 10 --batch-size 4
 日志路径均相对于 `work_root` 解释，checkpoint 和日志强制写在 `work_root` 内。
 train、validation 和 test 可以引用同一 POD5 文件，但不同 split 之间不得包含重复的
 `read_id`。
+
+训练在每轮 train 和 validation 完成后保存完整快照，例如 `heads.epoch_0001.pt`、
+`heads.epoch_0002.pt`，同时更新 `heads.pt` 供 `--resume` 继续最新进度。
+各快照包含模型、优化器、随机状态和版本元数据，可用现有评估命令选择任意一轮。
+历史快照增加磁盘占用；命名、覆盖规则和评估示例见
+[逐 epoch checkpoint](docs/checkpoints.md)。
 
 ## 按参考名称整理标称长度数据
 

@@ -71,6 +71,8 @@ def launch_training(
         str(training.chunk_size_samples),
         "--hidden-features",
         str(training.hidden_features),
+        "--length-head-mode",
+        training.length_head_mode,
         "--dropout",
         str(training.dropout),
         "--learning-rate",
@@ -91,7 +93,13 @@ def launch_training(
         str(config.auxiliary_loss.lambda_length),
         "--lambda-status",
         str(config.auxiliary_loss.lambda_status),
+        "--length-loss",
+        config.auxiliary_loss.length_loss,
+        "--huber-delta-nt",
+        str(config.auxiliary_loss.huber_delta_nt),
     ]
+    if training.data_order_seed is not None:
+        command.extend(("--data-order-seed", str(training.data_order_seed)))
     if dry_run:
         command.append("--dry-run")
     if resume:

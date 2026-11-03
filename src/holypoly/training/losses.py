@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as functional
@@ -13,28 +13,25 @@ from holypoly.models.poly_heads import (
     ReadStatus,
     masked_status_loss,
 )
+from holypoly.training.loss_config import normalize_loss_config
 
 
 @dataclass(frozen=True)
 class PolyLossWeights:
-    """Configurable weights for each recorded auxiliary loss."""
+    """Auxiliary weights and the selected length-regression objective."""
 
     lambda_location: float = 1.0
     lambda_length: float = 1.0
     lambda_status: float = 1.0
+    length_loss: str = "log_smooth_l1"
+    huber_delta_nt: float = 10.0
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("lambda_location", self.lambda_location),
-            ("lambda_length", self.lambda_length),
-            ("lambda_status", self.lambda_status),
-        ):
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative")
+        normalize_loss_config(asdict(self))
 
 
 class PolyAuxiliaryLoss(nn.Module):
-    """Compute masked location, log-length, and shared status losses."""
+    """Compute masked location, selectable length, and shared status losses."""
 
     def __init__(
         self,
@@ -90,10 +87,17 @@ class PolyAuxiliaryLoss(nn.Module):
         if torch.any(valid_lengths < 0):
             raise ValueError("non-failed training lengths must be non-negative")
         if torch.any(length_mask):
-            length_loss = functional.smooth_l1_loss(
-                torch.log1p(output.length.length_nt[length_mask]),
-                torch.log1p(valid_lengths),
-            )
+            predictions = output.length.length_nt[length_mask]
+            if self.weights.length_loss == "log_smooth_l1":
+                length_loss = functional.smooth_l1_loss(
+                    torch.log1p(predictions), torch.log1p(valid_lengths)
+                )
+            elif self.weights.length_loss == "mae":
+                length_loss = functional.l1_loss(predictions, valid_lengths)
+            else:
+                length_loss = functional.huber_loss(
+                    predictions, valid_lengths, delta=self.weights.huber_delta_nt
+                )
         else:
             length_loss = output.length.length_nt.sum() * 0.0
 

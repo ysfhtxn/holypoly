@@ -76,8 +76,9 @@ def _row(
     }
 
 
+@pytest.mark.parametrize("length_loss", ["log_smooth_l1", "mae", "huber"])
 def test_train_command_dry_run_reads_only_manifest_metadata(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], length_loss: str
 ) -> None:
     data_root = tmp_path / "data"
     work_root = tmp_path / "work"
@@ -161,6 +162,10 @@ def test_train_command_dry_run_reads_only_manifest_metadata(
             "1",
             "--lambda-status",
             "1",
+            "--length-loss",
+            length_loss,
+            "--huber-delta-nt",
+            "7.5",
             "--dry-run",
         ]
     )
@@ -168,6 +173,8 @@ def test_train_command_dry_run_reads_only_manifest_metadata(
     captured = capsys.readouterr()
     assert return_code == 0
     assert '"records": 2' in captured.out
+    assert f'"length_loss": "{length_loss}"' in captured.out
+    assert '"huber_delta_nt": 7.5' in captured.out
     assert "Dry run complete" in captured.out
     assert not checkpoint_path.exists()
     assert not loss_log_path.exists()

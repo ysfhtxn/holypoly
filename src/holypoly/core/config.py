@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from holypoly.models.length_head_config import validate_length_head_mode
+from holypoly.training.loss_config import normalize_loss_config
 
 DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 DATA_ROOT_ENV = "HOLYPOLY_DATA_ROOT"
@@ -60,11 +63,19 @@ class DoctorConfig:
 
 @dataclass(frozen=True)
 class AuxiliaryLossConfig:
-    """Weights for the auxiliary location, length, and shared status losses."""
+    """Auxiliary weights and length objective, independent of Torch imports."""
 
     lambda_location: float = 1.0
     lambda_length: float = 1.0
     lambda_status: float = 1.0
+    length_loss: str = "log_smooth_l1"
+    huber_delta_nt: float = 10.0
+
+    def __post_init__(self) -> None:
+        try:
+            normalize_loss_config(asdict(self))
+        except ValueError as error:
+            raise ConfigError(f"model.auxiliary_loss: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -86,6 +97,8 @@ class TrainingConfig:
     random_seed: int = 20260923
     num_workers: int = 0
     device: str = "cuda:0"
+    length_head_mode: str = "mean"
+    data_order_seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +215,11 @@ def load_config(
                 auxiliary_loss_values.get("lambda_status", 1.0),
                 "model.auxiliary_loss.lambda_status",
             ),
+            length_loss=auxiliary_loss_values.get("length_loss", "log_smooth_l1"),
+            huber_delta_nt=_positive_float(
+                auxiliary_loss_values.get("huber_delta_nt", 10.0),
+                "model.auxiliary_loss.huber_delta_nt",
+            ),
         ),
         training=TrainingConfig(
             manifest_path=manifest_path,
@@ -251,8 +269,26 @@ def load_config(
                 "training.num_workers",
             ),
             device=_required_device(training_values.get("device", "cuda:0")),
+            length_head_mode=_length_head_mode(
+                training_values.get("length_head_mode", "mean")
+            ),
+            data_order_seed=(
+                None
+                if training_values.get("data_order_seed") is None
+                else _non_negative_int(
+                    training_values["data_order_seed"], "training.data_order_seed"
+                )
+            ),
         ),
     )
+
+
+def _length_head_mode(value: object) -> str:
+    """Translate invalid head configuration into the normal config error type."""
+    try:
+        return validate_length_head_mode(value)
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
 
 
 def _read_yaml(path: Path, *, label: str) -> dict[str, Any]:

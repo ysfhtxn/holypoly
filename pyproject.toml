@@ -63,6 +63,7 @@ module = [
     "holypoly.training.losses",
     "holypoly.models.model",
     "holypoly.training.data",
+    "holypoly.training.sequence_data",
 ]
 disallow_subclassing_any = false
 

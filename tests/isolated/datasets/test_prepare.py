@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import random
 from array import array
@@ -192,12 +193,312 @@ def test_balancing_is_deterministic_and_split_ids_do_not_overlap() -> None:
     assert all(row["nominal_length_nt"] != 60 for row in sparse_result)
 
 
+@pytest.mark.parametrize(
+    ("poly_types", "per_group", "expected_count"),
+    [
+        (("polyA",), 8, 8),
+        (("polyA",), 100, 10),
+        (("polyT",), 100, 3),
+        (("polyA", "polyT"), 100, 3),
+    ],
+)
+def test_type_selection_removes_excluded_bottleneck_and_retains_zero(
+    poly_types: tuple[str, ...], per_group: int, expected_count: int
+) -> None:
+    counts = {
+        (20, "polyA"): 12,
+        (40, "polyA"): 10,
+        (20, "polyT"): 3,
+        (40, "polyT"): 4,
+        (0, "none"): 14,
+    }
+    rows = [
+        {
+            "read_id": f"{length}-{kind}-{index}",
+            "nominal_length_nt": length,
+            "poly_type": kind,
+        }
+        for (length, kind), count in counts.items()
+        for index in range(count)
+    ]
+    selected = balance_and_split(
+        rows, per_group, random.Random(5), poly_types=poly_types
+    )
+    expected_groups = {(0, "none"): expected_count}
+    expected_groups.update(
+        {(length, kind): expected_count for length in (20, 40) for kind in poly_types}
+    )
+    assert (
+        Counter((row["nominal_length_nt"], row["poly_type"]) for row in selected)
+        == expected_groups
+    )
+    assert len({row["read_id"] for row in selected}) == len(selected)
+    assert {row["split"] for row in selected} == {"train", "validation", "test"}
+    assert selected == balance_and_split(
+        rows, per_group, random.Random(5), poly_types=poly_types
+    )
+    # Fewer negatives must not reduce the available positive count.
+    scarce_zero = [row for row in rows if row["nominal_length_nt"] > 0] + [
+        row for row in rows if row["nominal_length_nt"] == 0
+    ][:3]
+    scarce_selected = balance_and_split(
+        scarce_zero, per_group, random.Random(5), poly_types=poly_types
+    )
+    assert Counter(row["nominal_length_nt"] for row in scarce_selected)[0] == 3
+    assert sum(row["nominal_length_nt"] > 0 for row in scarce_selected) == (
+        2 * len(poly_types) * expected_count
+    )
+
+
+def test_type_selection_requires_requested_positive_candidates() -> None:
+    rows = [
+        {"read_id": str(index), "nominal_length_nt": 20, "poly_type": "polyT"}
+        for index in range(5)
+    ]
+    with pytest.raises(ValueError, match="no_positive_reads"):
+        balance_and_split(rows, 100, random.Random(5), poly_types=("polyA",))
+    for invalid in ((), ("none",)):
+        with pytest.raises(ValueError, match="poly_types"):
+            balance_and_split(rows, 100, random.Random(5), poly_types=invalid)
+
+
+def _quota_alignment(
+    index: int, length: int, *, with_flank: bool = True
+) -> pysam.AlignedSegment:
+    """Create a unique synthetic primary with consistent move/sample metadata."""
+    record = alignment(str(UUID(int=index)), length)
+    if not with_flank:
+        record.query_sequence = HEAD + "A" * length
+        record.cigar = [(0, 24), (4, length)]
+        record.set_tag("mv", array("b", [6] + [1, 0] * record.query_length))
+        record.set_tag("ns", 10 + record.query_length * 12)
+    return record
+
+
+def _quota_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[pysam.AlignedSegment],
+    *,
+    poly_types: tuple[str, ...] = ("polyA",),
+) -> tuple[argparse.Namespace, list[str]]:
+    """Write synthetic BAMs and track POD5 metadata calls without loading signal."""
+    data_root, work_root = tmp_path / "inputs", tmp_path / "work"
+    data_root.mkdir()
+    work_root.mkdir()
+    (data_root / "synthetic.pod5").touch()
+    (data_root / "heads.fa").write_text("".join(f">{name}\n{HEAD}\n" for name in NAMES))
+    header = {"SQ": [{"SN": name, "LN": len(HEAD)} for name in NAMES]}
+    for filename in ("bonito.bam", "dorado.bam"):
+        with pysam.AlignmentFile(data_root / filename, "wb", header=header) as bam:
+            for record in records:
+                bam.write(record)
+    sample_counts = {record.query_name: record.get_tag("ns") + 2 for record in records}
+    metadata_read_ids: list[str] = []
+
+    class MetadataReader:
+        """Count individual metadata requests; no real POD5 data is needed."""
+
+        def __init__(self, path: Path) -> None:
+            assert path == data_root / "synthetic.pod5"
+
+        def __enter__(self) -> MetadataReader:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def reads(
+            self, *, selection: list[str], missing_ok: bool
+        ) -> list[SimpleNamespace]:
+            metadata_read_ids.extend(selection)
+            return [SimpleNamespace(num_samples=sample_counts[selection[0]])]
+
+    monkeypatch.setattr(pod5, "Reader", MetadataReader)
+    args = build_parser().parse_args(
+        [
+            "--data-root",
+            str(data_root),
+            "--work-root",
+            str(work_root),
+            "--bonito-bam",
+            "bonito.bam",
+            "--dorado-bam",
+            "dorado.bam",
+            "--reference",
+            "heads.fa",
+            "--pod5-dir",
+            ".",
+            "--chunk-size-samples",
+            "960",
+            "--min-flank-reads",
+            "3",
+            "--per-group",
+            "3",
+            "--max-records",
+            "0",
+            "--no-progress",
+            "--stop-when-full",
+            "--poly-types",
+            *poly_types,
+        ]
+    )
+    return args, metadata_read_ids
+
+
+@pytest.mark.parametrize("poly_types", [("polyA",), ("polyA", "polyT")])
+def test_quotas_skip_tail_metadata_but_validate_all_uuids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poly_types: tuple[str, ...]
+) -> None:
+    records = []
+    for index in range(3):
+        for offset, length in enumerate((0, 20, 40)):
+            records.append(_quota_alignment(index * 5 + offset + 1, length))
+        for offset, length in enumerate((20, 40)):
+            records.append(
+                alignment(str(UUID(int=index * 5 + offset + 4)), length, True)
+            )
+    records.extend(_quota_alignment(100 + index, 20) for index in range(4))
+    args, metadata_read_ids = _quota_setup(
+        tmp_path, monkeypatch, records, poly_types=poly_types
+    )
+    summary = prepare(args)
+    evaluated = 13 if len(poly_types) == 1 else 15
+    assert metadata_read_ids == [record.query_name for record in records[:evaluated]]
+    collection = summary["metadata_collection"]
+    assert collection["quota_reached"] and collection["final_quotas_met"]
+    assert collection["records_evaluated"] == evaluated
+    assert collection["records_skipped_after_quota"] == len(records) - evaluated
+    assert collection["uuid_validation_scope"] == "full_file"
+    assert collection["candidate_counts_scope"] == "evaluated_records_only"
+    assert summary["scan_counts"]["dorado_records"] == len(records)
+    assert (
+        summary["audit_counts"]["not_evaluated_quota_met"] == len(records) - evaluated
+    )
+    assert sum(summary["selected_counts"].values()) == 3 * (1 + 2 * len(poly_types))
+    assert summary["missing_positive_strata"] == []
+    manifest = Path(args.work_root) / args.output_dir / "manifest.tsv"
+    first_manifest = manifest.read_text()
+    metadata_read_ids.clear()
+    args.output_dir = Path("metadata/repeat")
+    assert prepare(args)["metadata_collection"] == collection
+    assert (
+        first_manifest
+        == (Path(args.work_root) / args.output_dir / "manifest.tsv").read_text()
+    )
+    metadata_read_ids.clear()
+    args.output_dir = Path("metadata/default")
+    args.stop_when_full = False
+    default_summary = prepare(args)
+    assert metadata_read_ids == [record.query_name for record in records]
+    assert default_summary["metadata_collection"]["records_skipped_after_quota"] == 0
+
+
+def test_late_duplicates_resume_collection_and_skipped_primary_stays_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = [
+        _quota_alignment(index + 1, length)
+        for index, length in enumerate([0] * 3 + [20] * 3 + [40] * 3)
+    ]
+    skipped = _quota_alignment(100, 20)
+    replacement = _quota_alignment(101, 20)
+    records = prefix + [
+        skipped,
+        prefix[3],
+        skipped,
+        replacement,
+        _quota_alignment(102, 40),
+    ]
+    args, metadata_read_ids = _quota_setup(tmp_path, monkeypatch, records)
+    summary = prepare(args)
+    assert metadata_read_ids == [r.query_name for r in prefix] + [
+        replacement.query_name
+    ]
+    assert summary["metadata_collection"]["quota_resumptions"] == 1
+    assert summary["metadata_collection"]["final_quotas_met"]
+    assert summary["metadata_collection"]["records_skipped_after_quota"] == 2
+    assert summary["audit_counts"]["duplicate_dorado_primary"] == 2
+    loaded = load_training_manifest(
+        Path(args.work_root) / args.output_dir / "manifest.tsv"
+    )
+    assert len(loaded) == 9
+    assert prefix[3].query_name not in {r.read_id for r in loaded}
+    assert replacement.query_name in {r.read_id for r in loaded}
+
+
+@pytest.mark.parametrize("scenario", ["missing_group", "unverified_flank"])
+def test_unmet_quota_or_flank_qc_keeps_collecting_until_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    records = [
+        _quota_alignment(
+            index + 1,
+            length,
+            with_flank=not (scenario == "unverified_flank" and length == 40),
+        )
+        for index, length in enumerate([0] * 3 + [20] * 3 + [40] * 3)
+    ]
+    if scenario == "missing_group":
+        for record in records[-3:]:
+            record.flag = (
+                16  # These support flank QC but not the requested polyA quota.
+            )
+    args, metadata_read_ids = _quota_setup(tmp_path, monkeypatch, records)
+    summary = prepare(args)
+    assert metadata_read_ids == [r.query_name for r in records]
+    assert not summary["metadata_collection"]["quota_reached"]
+    assert not summary["metadata_collection"]["final_quotas_met"]
+    assert summary["metadata_collection"]["records_skipped_after_quota"] == 0
+    if scenario == "missing_group":
+        assert summary["missing_positive_strata"] == ["40:polyA"]
+        assert summary["flank_status"] == "provisional_cross_checked"
+    else:
+        assert summary["flank_status"] == "unverified"
+        assert summary["supervision_counts"] == {"length_only": 6}
+
+
+def test_quotas_wait_for_flank_support_and_resume_when_duplicate_removes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = [
+        _quota_alignment(index + 1, length, with_flank=length == 0)
+        for index, length in enumerate([0] * 3 + [20] * 3 + [40] * 3)
+    ]
+    support = [
+        alignment(str(UUID(int=100 + index)), length, True)
+        for index, length in enumerate((20, 40, 40))
+    ]
+    replacement = alignment(str(UUID(int=104)), 20, True)
+    records = (
+        prefix
+        + support
+        + [
+            _quota_alignment(103, 20),
+            support[0],
+            replacement,
+            _quota_alignment(105, 40),
+        ]
+    )
+    args, metadata_read_ids = _quota_setup(tmp_path, monkeypatch, records)
+    summary = prepare(args)
+    assert metadata_read_ids == [r.query_name for r in prefix + support] + [
+        replacement.query_name
+    ]
+    assert summary["metadata_collection"]["quota_resumptions"] == 1
+    assert summary["metadata_collection"]["final_quotas_met"]
+    assert summary["cross_length_flank_support"] == {20: 1, 40: 2}
+    assert summary["supervision_counts"] == {"full": 3, "length_only": 6}
+
+
+@pytest.mark.parametrize("poly_types", [("polyA", "polyT"), ("polyA",)])
 @pytest.mark.parametrize("with_flank", [True, False])
 def test_builder_roundtrip_through_training_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     with_flank: bool,
+    poly_types: tuple[str, ...],
 ) -> None:
     data_root, work_root = tmp_path / "inputs", tmp_path / "work"
     data_root.mkdir()
@@ -271,6 +572,8 @@ def test_builder_roundtrip_through_training_dataset(
             "960",
             "--min-flank-reads",
             "3",
+            "--poly-types",
+            *poly_types,
         ]
     )
     summary = prepare(args)
@@ -284,10 +587,28 @@ def test_builder_roundtrip_through_training_dataset(
         assert stage in progress_output.err
     output = work_root / "metadata/poly-dataset-v3"
     records_loaded = load_training_manifest(output / "manifest.tsv")
-    expected_count = 20 if with_flank else 16
+    expected_count = (
+        (20 if with_flank else 16)
+        if len(poly_types) == 2
+        else (15 if with_flank else 10)
+    )
     assert len(records_loaded) == expected_count
     assert summary["flank_sequence"] == (FLANK if with_flank else "")
     assert summary["audit_counts"]["conflicting_bonito_constructs"] == 1
+    assert summary["arguments"]["poly_types"] == list(poly_types)
+    assert summary["missing_positive_strata"] == []
+    assert all(
+        record.nominal_length_nt == 0 or record.poly_type.value in poly_types
+        for record in records_loaded
+    )
+    if len(poly_types) == 1:
+        assert summary["excluded_poly_type_counts"] == {
+            "20:polyT": 4,
+            "40:polyT": 5,
+        }
+        assert summary["audit_counts"]["not_selected_poly_type"] == 9
+    else:
+        assert summary["excluded_poly_type_counts"] == {}
     dataset = PolyTrainingDataset(
         records_loaded,
         lambda path, read_id: torch.arange(sample_counts[read_id], dtype=torch.float32),
@@ -318,7 +639,7 @@ def test_builder_roundtrip_through_training_dataset(
         assert torch.all(batch.location_targets == -100)
         assert torch.all(batch.status_targets == -100)
         assert all(record.poly_is_complete is None for record in records_loaded)
-        assert summary["supervision_counts"] == {"length_only": 16}
+        assert summary["supervision_counts"] == {"length_only": expected_count}
     first_manifest = (output / "manifest.tsv").read_text()
     args.output_dir = Path("metadata/repeat")
     args.no_progress = True
@@ -331,7 +652,9 @@ def test_builder_roundtrip_through_training_dataset(
     args.min_flank_reads = 1000
     unsupported = prepare(args)
     assert unsupported["flank_status"] == "unverified"
-    assert unsupported["supervision_counts"] == {"length_only": 16}
+    assert unsupported["supervision_counts"] == {
+        "length_only": 16 if len(poly_types) == 2 else 10
+    }
     args.output_dir = Path("metadata/invalid-signal-length")
     for read_id in sample_counts:
         sample_counts[read_id] += 4  # Difference now equals one full stride.

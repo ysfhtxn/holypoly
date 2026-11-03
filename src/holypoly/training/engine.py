@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import platform
 import random
+import shutil
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
@@ -15,9 +16,10 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from holypoly.models.model import HolypolyModel
+from holypoly.models.model import HolypolyModel, head_config_from_checkpoint
 from holypoly.models.poly_heads import PolyClass, ReadStatus
 from holypoly.training.data import PolyTrainingBatch
+from holypoly.training.loss_config import normalize_loss_config
 from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
 
 
@@ -46,6 +48,8 @@ class CheckpointContext:
     manifest_schema_version: str
     loss_weights: PolyLossWeights
     git_commit: str
+    data_order_seed: int | None = None
+    joint_config: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +208,13 @@ def validate_one_epoch(
     return accumulator.result(global_step)
 
 
+def epoch_checkpoint_path(path: Path, epoch: int) -> Path:
+    """Name a full epoch snapshot beside the latest checkpoint, starting at 1."""
+    if epoch < 1:
+        raise ValueError("checkpoint epoch must be greater than zero")
+    return path.with_name(f"{path.stem}.epoch_{epoch:04d}{path.suffix}")
+
+
 def save_checkpoint(
     path: Path,
     *,
@@ -213,12 +224,33 @@ def save_checkpoint(
     global_step: int,
     context: CheckpointContext,
     data_root: Path | None = None,
+    work_root: Path | None = None,
+    archive_epoch: bool = False,
 ) -> None:
-    """Atomically save model, optimizer, RNG, software, and label metadata."""
-    _ensure_output_is_safe(path, data_root)
+    """Save a full checkpoint, optionally retaining an immutable epoch snapshot.
+
+    Serialize once, copy to the epoch snapshot, then replace the latest file.
+    Each file is published atomically. Existing epoch snapshots are rejected.
+    """
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    archive_path = epoch_checkpoint_path(path, epoch) if archive_epoch else None
+    archive_temporary = (
+        archive_path.with_suffix(archive_path.suffix + ".tmp")
+        if archive_path is not None
+        else None
+    )
+    for output_path in (path, temporary_path, archive_path, archive_temporary):
+        if output_path is not None:
+            _ensure_output_is_safe(output_path, data_root, work_root=work_root)
+    if archive_path is not None and (
+        archive_path.exists() or archive_path.is_symlink()
+    ):
+        raise FileExistsError(f"epoch checkpoint already exists: {archive_path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model_state_dict": model.state_dict(),
+        "head_config": dict(model.head_config),
+        "data_order_seed": context.data_order_seed,
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "global_step": global_step,
@@ -237,8 +269,12 @@ def save_checkpoint(
         "torch_random_state": torch.get_rng_state(),
         "cuda_random_states": torch.cuda.get_rng_state_all(),
     }
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    if context.joint_config is not None:
+        payload["joint_config"] = dict(context.joint_config)
     torch.save(payload, temporary_path)
+    if archive_path is not None and archive_temporary is not None:
+        shutil.copyfile(temporary_path, archive_temporary)
+        archive_temporary.replace(archive_path)
     temporary_path.replace(path)
 
 
@@ -248,12 +284,42 @@ def load_checkpoint(
     model: HolypolyModel,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    data_order_seed: int | None = None,
+    loss_weights: PolyLossWeights | None = None,
+    joint_config: Mapping[str, Any] | None = None,
 ) -> ResumeState:
     """Restore model, optimizer, epoch, step, and random states."""
     require_single_cuda_device(device)
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {path}")
     payload = torch.load(path, map_location=device, weights_only=False)
+    expected_joint = dict(joint_config) if joint_config is not None else None
+    if payload.get("joint_config") != expected_joint:
+        raise ValueError("joint training configuration differs from the checkpoint")
+    saved_loss_config = payload.get("loss_config")
+    if not isinstance(saved_loss_config, Mapping):
+        raise ValueError("checkpoint loss_config must be a mapping")
+    saved_loss_config = normalize_loss_config(saved_loss_config)
+    requested_loss_config = normalize_loss_config(
+        asdict(loss_weights or PolyLossWeights())
+    )
+    # Delta has no effect outside Huber; still retain it in every saved record.
+    loss_keys = ["lambda_location", "lambda_length", "lambda_status", "length_loss"]
+    if requested_loss_config["length_loss"] == "huber":
+        loss_keys.append("huber_delta_nt")
+    if any(saved_loss_config[key] != requested_loss_config[key] for key in loss_keys):
+        raise ValueError(
+            "loss configuration differs from the checkpoint; "
+            "use matching settings to resume, or start a new experiment"
+        )
+    if payload.get("data_order_seed") != data_order_seed:
+        raise ValueError("data order seed differs from the checkpoint")
+    head_config = head_config_from_checkpoint(payload)
+    keys: tuple[str, ...] = ("length_head_mode", "hidden_features", "dropout")
+    if "head_config" not in payload:
+        keys = ("length_head_mode", "hidden_features")
+    if any(head_config[key] != model.head_config[key] for key in keys):
+        raise ValueError("length head configuration differs from the checkpoint")
     model.load_state_dict(payload["model_state_dict"])
     optimizer.load_state_dict(payload["optimizer_state_dict"])
     random.setstate(payload["python_random_state"])
@@ -274,12 +340,15 @@ def append_loss_log(
     *,
     epoch: int,
     split: str | None = None,
+    loss_weights: PolyLossWeights | None = None,
 ) -> None:
     """Append one JSON record containing every loss and metric."""
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {"epoch": epoch, **asdict(result)}
     if split is not None:
         record["split"] = split
+    if loss_weights is not None:
+        record["loss_config"] = asdict(loss_weights)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -416,7 +485,9 @@ def _batch_to_device(
     )
 
 
-def _ensure_output_is_safe(path: Path, data_root: Path | None) -> None:
+def _ensure_output_is_safe(
+    path: Path, data_root: Path | None, *, work_root: Path | None = None
+) -> None:
     resolved_path = path.expanduser().resolve()
     if data_root is not None:
         resolved_data_root = data_root.expanduser().resolve()
@@ -425,4 +496,12 @@ def _ensure_output_is_safe(path: Path, data_root: Path | None) -> None:
         ):
             raise ValueError(
                 f"checkpoint path must not be inside data_root: {resolved_path}"
+            )
+    if work_root is not None:
+        resolved_work_root = work_root.expanduser().resolve()
+        if resolved_path == resolved_work_root or not resolved_path.is_relative_to(
+            resolved_work_root
+        ):
+            raise ValueError(
+                f"checkpoint path must be inside work_root: {resolved_path}"
             )

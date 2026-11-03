@@ -190,7 +190,9 @@ def test_prepared_manifest_signal_backward_and_checkpoint() -> None:
     assert before == {
         path: (path.stat().st_size, path.stat().st_mtime_ns) for path in inputs
     }
-    output_dir = (work_root / "results" / checkpoint.parent.name).resolve()
+    output_dir = (
+        work_root / "results" / "training_evaluation" / checkpoint.parent.name
+    ).resolve()
     assert output_dir.is_relative_to(work_root) and not output_dir.is_relative_to(
         data_root
     )

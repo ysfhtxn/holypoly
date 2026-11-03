@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import random
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Generator, Sequence
+from collections.abc import Collection, Generator, Mapping, Sequence
 from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from itertools import islice
@@ -26,6 +27,7 @@ from holypoly.core.config import load_config
 from holypoly.datasets.length_groups import parse_nominal_length_nt
 
 VERSION = "construct-nominal-head-excluded-v3"
+HEAD_POLY_VERSION = "construct-nominal-head-poly-v4"
 FIELDS = (  # noqa: SIM905 -- Compact declaration of a wide scientific table.
     "manifest_version read_id pod5_path bam_path pod5_file_id split orientation "
     "raw_signal_length chunk_start_sample chunk_end_sample poly_start_sample "
@@ -304,20 +306,115 @@ def head_free_bounds(
     return start, end, end if record.is_reverse else start
 
 
+def head_poly_bounds(
+    record: Any,
+    head_end_base: int,
+    raw_length: int,
+    model_input_samples: int,
+    min_candidate_samples: int = 12,
+) -> tuple[int, int, int]:
+    """Keep a head-excluded raw-edge candidate, not a labeled Poly interval.
+
+    Coordinates are absolute raw samples [start, end). The raw edge can include
+    adapter/noise; completeness and Poly endpoint remain unknown. A head-only
+    read is usable only if real signal remains on the candidate side.
+    """
+    boundary, _ = move_bounds(record, head_end_base, head_end_base)
+    if head_end_base < record.query_length:
+        adjacent_start, adjacent_end = move_bounds(
+            record,
+            head_end_base if record.is_reverse else head_end_base - 1,
+            head_end_base + 1 if record.is_reverse else head_end_base,
+        )
+        if adjacent_start == adjacent_end:
+            raise ValueError("head_downstream_share_move_block")
+    start, end = (0, boundary) if record.is_reverse else (boundary, raw_length)
+    if not 0 <= start < end <= raw_length:
+        raise ValueError("no_real_post_head_signal")
+    if end - start < min_candidate_samples:
+        raise ValueError("post_head_signal_below_min_samples")
+    if end - start > model_input_samples:
+        raise ValueError("head_free_signal_empty_or_exceeds_chunk")
+    return start, end, boundary
+
+
+def _sampling_group(
+    row: Mapping[str, Any], *, split_zero_orientation: bool = False
+) -> tuple[int, str]:
+    """Return a sampling stratum without changing biological label fields."""
+    length = int(row["nominal_length_nt"])
+    if split_zero_orientation and length == 0:
+        orientation = row["orientation"]
+        if orientation not in {"forward", "reverse"}:
+            raise ValueError("zero_nt requires forward/reverse orientation")
+        return 0, f"none:{orientation}"
+    return length, str(row["poly_type"])
+
+
 def balance_and_split(
-    rows: Sequence[dict[str, Any]], per_group: int, rng: random.Random
+    rows: Sequence[dict[str, Any]],
+    per_group: int,
+    rng: random.Random,
+    *,
+    poly_types: Sequence[str] = ("polyA", "polyT"),
+    balance_to_smallest: bool = True,
+    strict_groups: Collection[tuple[int, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Downsample length/type strata equally and split UUIDs without replacement."""
+    """Balance selected positive types, retain zero_nt, and split unique UUIDs.
+
+    Excluded positive types never limit the common per-stratum sample count.
+    Zero-length reads retain their original orientations and are capped at that
+    count, without limiting the positive strata when negatives are scarce.
+    With ``balance_to_smallest=False`` (v4), cap each group independently and
+    preserve shortages for the summary instead of shrinking every other group.
+    Explicit ``strict_groups`` instead requires all listed strata, including
+    zero_nt orientations, and downsamples all of them to a common count.
+    """
+    if not poly_types or set(poly_types) - {"polyA", "polyT"}:
+        raise ValueError("poly_types must contain polyA and/or polyT")
     groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[(row["nominal_length_nt"], row["poly_type"])].append(row)
+        if row["nominal_length_nt"] > 0 and row["poly_type"] not in poly_types:
+            continue
+        groups[
+            _sampling_group(row, split_zero_orientation=strict_groups is not None)
+        ].append(row)
+    if strict_groups is not None:
+        if not strict_groups:
+            raise ValueError("strict balance requires nonempty target strata")
+        insufficient = {
+            f"{length}:{kind}": len(groups[(length, kind)])
+            for length, kind in sorted(strict_groups)
+            if len(groups[(length, kind)]) < 3
+        }
+        if insufficient:
+            raise ValueError(
+                f"strict balance requires at least 3 reads in every stratum: "
+                f"{insufficient}"
+            )
+        groups = {key: groups[key] for key in sorted(strict_groups)}
+        if len({row["read_id"] for group in groups.values() for row in group}) != sum(
+            len(group) for group in groups.values()
+        ):
+            raise ValueError("strict balance requires unique read_id values")
     positive_groups = [group for key, group in groups.items() if key[0] > 0]
     if not positive_groups:
-        raise ValueError("no_positive_reads_with_both_anchors")
+        raise ValueError(
+            "no_positive_reads_with_both_anchors"
+            if balance_to_smallest
+            else "no_positive_reads_with_valid_head"
+        )
     supported_groups = [group for group in positive_groups if len(group) >= 3]
     if not supported_groups:
         raise ValueError("need_at_least_3_reads_per_present_positive_stratum")
-    count = min(per_group, *(len(group) for group in supported_groups))
+    if strict_groups is not None:
+        count = min(per_group, *(len(group) for group in groups.values()))
+    else:
+        count = (
+            min(per_group, *(len(group) for group in supported_groups))
+            if balance_to_smallest
+            else per_group
+        )
     selected = []
     for key in sorted(groups):
         group = sorted(groups[key], key=lambda row: row["read_id"])
@@ -335,9 +432,36 @@ def balance_and_split(
                 if index < validation_count + test_count
                 else "train"
             )
-            row["selection_reason"] = "balanced_nominal_length_and_poly_type"
+            row["selection_reason"] = (
+                "strict_balanced_length_type_and_zero_orientation"
+                if strict_groups is not None
+                else "balanced_nominal_length_and_poly_type"
+                if balance_to_smallest
+                else "capped_nominal_length_and_poly_type"
+            )
             selected.append(row)
     return selected
+
+
+def _metadata_quotas_met(
+    group_counts: Mapping[tuple[int, str], int],
+    target_groups: Collection[tuple[int, str]],
+    per_group: int,
+    cross_lengths: Mapping[int, int],
+    min_flank_reads: int,
+    *,
+    require_flank: bool = True,
+) -> bool:
+    """Require all quotas and, for legacy v3 only, provisional flank support."""
+    return (
+        bool(target_groups)
+        and all(group_counts.get(group, 0) >= per_group for group in target_groups)
+        and (
+            not require_flank
+            or len(cross_lengths) >= 2
+            and sum(cross_lengths.values()) >= min_flank_reads
+        )
+    )
 
 
 def write_table(
@@ -368,11 +492,21 @@ def write_audit(output: Path, assigned: dict[str, str], audit: dict[str, str]) -
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    """Infer flank, audit UUID-linked reads and emit a training-compatible manifest."""
+    """Build head-Poly v4 or legacy flank-based v3 weak-label manifests."""
     from pod5 import Reader
 
     from holypoly.training.data import load_training_manifest
 
+    head_poly = args.structure == "head-poly"
+    strict_balance = args.strict_balance
+    if strict_balance and (not head_poly or set(args.poly_types) != {"polyA", "polyT"}):
+        raise ValueError("--strict-balance requires head-poly and both polyA/polyT")
+    if head_poly and args.signal_end_policy != "raw-edge":
+        raise ValueError("head-poly requires explicit --signal-end-policy raw-edge")
+    if not head_poly and args.signal_end_policy is not None:
+        raise ValueError("--signal-end-policy is only supported for head-poly")
+    if not 1 <= args.min_candidate_samples <= args.chunk_size_samples:
+        raise ValueError("min_candidate_samples must fit inside chunk_size_samples")
     started = datetime.now(UTC).isoformat()
     config = load_config(
         args.config, cli_data_root=args.data_root, cli_work_root=args.work_root
@@ -410,12 +544,32 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("invalid record/group/support limits")
     if args.anchor_bases < 12 or not 0 <= args.anchor_error_rate < 0.5:
         raise ValueError("anchor_bases >= 12 and 0 <= anchor_error_rate < 0.5 required")
+    exclusion_path = getattr(args, "exclude_read_ids", None)
+    excluded_ids: set[str] = set()
+    exclusion_sha256 = None
+    if exclusion_path is not None:
+        exclusion_path = (work_root / exclusion_path).resolve()
+        if (
+            not exclusion_path.is_file()
+            or not exclusion_path.is_relative_to(work_root)
+            or exclusion_path.is_relative_to(data_root)
+        ):
+            raise ValueError("exclude-read-ids must exist inside work_root")
+        identifiers = exclusion_path.read_text().splitlines()
+        excluded_ids = {str(UUID(identifier)) for identifier in identifiers}
+        if not identifiers or len(excluded_ids) != len(identifiers):
+            raise ValueError("exclude-read-ids must contain unique nonempty UUIDs")
+        exclusion_sha256 = hashlib.sha256(exclusion_path.read_bytes()).hexdigest()
     if not 0.5 <= args.min_poly_fraction <= 1 or args.seed < 0:
         raise ValueError("invalid Poly fraction or seed")
-    full_scan_gib = (bonito.stat().st_size + 2 * dorado.stat().st_size) / 1024**3
+    dorado_passes = 1 if head_poly else 2
+    full_scan_gib = (
+        bonito.stat().st_size + dorado_passes * dorado.stat().st_size
+    ) / 1024**3
     print(
         f"CPU metadata preparation; {args.max_records or 'all'} records per pass. "
-        f"Bonito once, Dorado twice; full BAM scan <= {full_scan_gib:.2f} GiB. "
+        f"Bonito once, Dorado {dorado_passes} pass(es); "
+        f"full BAM scan <= {full_scan_gib:.2f} GiB. "
         "POD5 metadata only, no signal copies/GPU. Full HDD runs may take "
         "minutes to hours; audit output may reach hundreds of MB per million "
         "reads. Start with a bounded run.",
@@ -423,9 +577,39 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         flush=True,
     )
     heads = load_heads(reference)
+    positive_lengths = {
+        length
+        for name in heads
+        if (length := parse_nominal_length_nt(name)) is not None and length > 0
+    }
+    target_groups = {
+        (length, kind) for length in positive_lengths for kind in args.poly_types
+    }
+    if any(parse_nominal_length_nt(name) == 0 for name in heads):
+        if strict_balance:
+            target_groups.update({(0, "none:forward"), (0, "none:reverse")})
+        else:
+            target_groups.add((0, "none"))
+    elif strict_balance:
+        raise ValueError("--strict-balance requires a zero_nt construct in reference")
+    if args.stop_when_full:
+        print(
+            f"Metadata collection will pause at {args.per_group} eligible reads "
+            "per requested stratum"
+            + (". " if head_poly else " once flank QC passes. ")
+            + "Remaining BAM records "
+            "still undergo lightweight UUID checks; sampling is from evaluated "
+            "candidates, not uniformly from the whole file.",
+            file=sys.stderr,
+            flush=True,
+        )
     assigned, conflicts, counts = construct_assignments(
         bonito, heads, args.max_records, progress=not args.no_progress
     )
+    excluded_assigned = len(assigned.keys() & excluded_ids)
+    for read_id in excluded_ids:
+        assigned.pop(read_id, None)
+    conflicts.difference_update(excluded_ids)
     output.mkdir(parents=True)
     audit = {
         read_id: "conflicting_bonito_constructs"
@@ -436,51 +620,61 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     write_audit(output, assigned, audit)
     candidates = []
     candidate_ids: set[str] = set()
-    with closing(
-        bam_records(
-            dorado,
-            args.max_records,
-            desc="2/3 Dorado flank candidates",
-            progress=not args.no_progress,
-        )
-    ) as records:
-        for record in records:
-            if record.is_secondary or record.is_supplementary:
-                continue
-            read_id = record.query_name
-            name = assigned.get(read_id)
-            if (
-                name is None
-                or read_id in conflicts
-                or read_id in candidate_ids
-                or name not in heads
-                or parse_nominal_length_nt(name) != 0
-                or record.reference_name != name
-            ):
-                continue
-            try:
-                end = head_boundary(
-                    record, heads[name], args.anchor_bases, args.anchor_error_rate
-                )
-                candidate = record.query_sequence[end : end + args.anchor_bases]
-                if len(candidate) == args.anchor_bases and not set(candidate) - set(
-                    "ACGT"
+    if not head_poly:
+        with closing(
+            bam_records(
+                dorado,
+                args.max_records,
+                desc="2/3 Dorado flank candidates",
+                progress=not args.no_progress,
+            )
+        ) as records:
+            for record in records:
+                if record.is_secondary or record.is_supplementary:
+                    continue
+                read_id = record.query_name
+                name = assigned.get(read_id)
+                if (
+                    name is None
+                    or read_id in conflicts
+                    or read_id in candidate_ids
+                    or name not in heads
+                    or parse_nominal_length_nt(name) != 0
+                    or record.reference_name != name
                 ):
-                    candidates.append(candidate)
-                    candidate_ids.add(read_id)
-            except ValueError:
-                continue
-            if len(candidates) >= 200:
-                break
+                    continue
+                try:
+                    end = head_boundary(
+                        record, heads[name], args.anchor_bases, args.anchor_error_rate
+                    )
+                    candidate = record.query_sequence[end : end + args.anchor_bases]
+                    if len(candidate) == args.anchor_bases and not set(candidate) - set(
+                        "ACGT"
+                    ):
+                        candidates.append(candidate)
+                        candidate_ids.add(read_id)
+                except ValueError:
+                    continue
+                if len(candidates) >= 200:
+                    break
     flank_reason = ""
-    try:
-        flank = infer_flank(candidates, args.min_flank_reads, args.anchor_error_rate)
-    except ValueError as error:
-        flank = ""
-        flank_reason = str(error)
+    flank = ""
+    if not head_poly:
+        try:
+            flank = infer_flank(
+                candidates, args.min_flank_reads, args.anchor_error_rate
+            )
+        except ValueError as error:
+            flank_reason = str(error)
     rng = random.Random(args.seed)
     rows: dict[str, dict[str, Any]] = {}
     cross_lengths: Counter[int] = Counter()
+    group_counts: Counter[tuple[int, str]] = Counter()
+    metadata_paused = False
+    quota_reached = False
+    quota_resumptions = 0
+    metadata_records = 0
+    metadata_skipped = 0
     seen: set[str] = set()
     with ExitStack() as stack:
         readers: dict[Path, Any] = {}
@@ -489,7 +683,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 bam_records(
                     dorado,
                     args.max_records,
-                    desc="3/3 Dorado boundaries / POD5 metadata",
+                    desc=(
+                        "2/2 Dorado head / POD5 metadata"
+                        if head_poly
+                        else "3/3 Dorado boundaries / POD5 metadata"
+                    ),
                     progress=not args.no_progress,
                 )
             )
@@ -502,10 +700,46 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             if read_id not in assigned or read_id in conflicts:
                 continue
             if read_id in seen:
-                rows.pop(read_id, None)
+                removed = rows.pop(read_id, None)
+                if removed is not None:
+                    group = _sampling_group(
+                        removed, split_zero_orientation=strict_balance
+                    )
+                    group_counts[group] -= 1
+                    if group_counts[group] == 0:
+                        del group_counts[group]
+                    if (
+                        removed["nominal_length_nt"] > 0
+                        and removed["supervision_mode"] == "full"
+                    ):
+                        length = removed["nominal_length_nt"]
+                        cross_lengths[length] -= 1
+                        if cross_lengths[length] == 0:
+                            del cross_lengths[length]
                 audit[read_id] = "duplicate_dorado_primary"
+                if metadata_paused and not _metadata_quotas_met(
+                    group_counts,
+                    target_groups,
+                    args.per_group,
+                    cross_lengths,
+                    args.min_flank_reads,
+                    require_flank=not head_poly,
+                ):
+                    metadata_paused = False
+                    quota_resumptions += 1
+                    print(
+                        "Duplicate primary invalidated a quota or quality support; "
+                        "resuming boundary/POD5 metadata collection.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 continue
             seen.add(read_id)
+            if metadata_paused:
+                audit[read_id] = "not_evaluated_quota_met"
+                metadata_skipped += 1
+                continue
+            metadata_records += 1
             name = assigned[read_id]
             nominal = parse_nominal_length_nt(name)
             try:
@@ -513,6 +747,13 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     raise ValueError("unassigned_bonito_construct")
                 if record.reference_name != name:
                     raise ValueError("bonito_dorado_construct_disagreement")
+                requested_type = "polyT" if record.is_reverse else "polyA"
+                if head_poly and requested_type not in args.poly_types:
+                    raise ValueError(
+                        "not_selected_poly_type"
+                        if nominal > 0
+                        else "not_selected_zero_orientation"
+                    )
                 head_end = head_boundary(
                     record, heads[name], args.anchor_bases, args.anchor_error_rate
                 )
@@ -530,17 +771,20 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     except ValueError as error:
                         boundary_reason = str(error)
-                if flank_start is None and nominal == 0:
+                if not head_poly and flank_start is None and nominal == 0:
                     raise ValueError(f"zero_nt_boundary_unverified:{boundary_reason}")
-                candidate_start, candidate_end, head_boundary_sample = head_free_bounds(
-                    record, head_end, args.chunk_size_samples
+                # v4 waits for POD5 raw length before defining a raw-edge candidate.
+                candidate_start, candidate_end, head_boundary_sample = (
+                    (0, 0, 0)
+                    if head_poly
+                    else head_free_bounds(record, head_end, args.chunk_size_samples)
                 )
                 poly_start, poly_end = (
                     move_bounds(record, head_end, flank_start)
                     if flank_start is not None
                     else (candidate_start, candidate_end)
                 )
-                if nominal > 0 and poly_start >= poly_end:
+                if not head_poly and nominal > 0 and poly_start >= poly_end:
                     raise ValueError("poly_bounds_share_move_block")
                 if not record.has_tag("fn"):
                     raise ValueError("missing_pod5_filename")
@@ -566,8 +810,18 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 move_stride = int(record.get_tag("mv")[0])
                 if not 0 <= raw_length - dorado_samples < move_stride:
                     raise ValueError("pod5_dorado_signal_length_mismatch")
+                if head_poly:
+                    candidate_start, candidate_end, head_boundary_sample = (
+                        head_poly_bounds(
+                            record,
+                            head_end,
+                            raw_length,
+                            args.chunk_size_samples,
+                            args.min_candidate_samples,
+                        )
+                    )
                 rows[read_id] = {
-                    "manifest_version": VERSION,
+                    "manifest_version": HEAD_POLY_VERSION if head_poly else VERSION,
                     "read_id": read_id,
                     "pod5_path": str(pod5_path),
                     "bam_path": str(dorado),
@@ -608,19 +862,45 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     "head_excluded": "true",
                     "head_boundary_sample": head_boundary_sample,
                 }
-                if flank_start is None:
+                if head_poly:
+                    length_only_row(rows[read_id], "not_applicable_head_poly")
+                    rows[read_id].update(
+                        flank_status="not_applicable_no_flank",
+                        flank_source="not_applicable_no_flank",
+                    )
+                elif flank_start is None:
                     length_only_row(rows[read_id], boundary_reason)
+                row = rows[read_id]
+                group_counts[
+                    _sampling_group(row, split_zero_orientation=strict_balance)
+                ] += 1
+                if nominal > 0 and row["supervision_mode"] == "full":
+                    cross_lengths[nominal] += 1
                 audit[read_id] = "eligible"
+                if args.stop_when_full and _metadata_quotas_met(
+                    group_counts,
+                    target_groups,
+                    args.per_group,
+                    cross_lengths,
+                    args.min_flank_reads,
+                    require_flank=not head_poly,
+                ):
+                    metadata_paused = True
+                    quota_reached = True
+                    print(
+                        "All requested quotas and quality checks satisfied; pausing "
+                        "boundary/POD5 metadata collection. Continuing lightweight "
+                        "UUID validation to the scan limit/EOF.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             except ValueError as error:
                 audit[read_id] = str(error)
-    for row in rows.values():
-        if row["nominal_length_nt"] > 0 and row["supervision_mode"] == "full":
-            cross_lengths[row["nominal_length_nt"]] += 1
     write_audit(output, assigned, audit)
     flank_validated = (
         len(cross_lengths) >= 2 and sum(cross_lengths.values()) >= args.min_flank_reads
     )
-    if not flank_validated:
+    if not head_poly and not flank_validated:
         flank_reason = flank_reason or "insufficient_cross_length_flank_support"
         for read_id, row in list(rows.items()):
             if row["nominal_length_nt"] == 0:
@@ -629,10 +909,21 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             elif row["supervision_mode"] == "full":
                 length_only_row(row, flank_reason)
     write_audit(output, assigned, audit)
-    selected = balance_and_split(list(rows.values()), args.per_group, rng)
+    selected = balance_and_split(
+        list(rows.values()),
+        args.per_group,
+        rng,
+        poly_types=args.poly_types,
+        balance_to_smallest=not head_poly,
+        strict_groups=target_groups if strict_balance else None,
+    )
     selected_ids = {row["read_id"] for row in selected}
     eligible_counts = Counter(
-        (row["nominal_length_nt"], row["poly_type"]) for row in rows.values()
+        _sampling_group(row, split_zero_orientation=strict_balance)
+        for row in rows.values()
+    )
+    selected_group_counts = Counter(
+        _sampling_group(row, split_zero_orientation=strict_balance) for row in selected
     )
     for read_id in assigned:
         if read_id not in audit:
@@ -641,28 +932,50 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             audit[read_id] = f"selected_{rows[read_id]['supervision_mode']}"
         elif audit[read_id] == "eligible":
             row = rows[read_id]
-            group_count = eligible_counts[(row["nominal_length_nt"], row["poly_type"])]
+            if row["nominal_length_nt"] > 0 and row["poly_type"] not in args.poly_types:
+                audit[read_id] = "not_selected_poly_type"
+                continue
+            group_count = eligible_counts[
+                _sampling_group(row, split_zero_orientation=strict_balance)
+            ]
             audit[read_id] = (
                 "not_selected_insufficient_group"
                 if group_count < 3
                 else "not_selected_balancing"
             )
-    positive_lengths = {
-        length
-        for name in heads
-        if (length := parse_nominal_length_nt(name)) is not None and length > 0
-    }
     summary: dict[str, Any] = {
-        "manifest_version": VERSION,
+        "manifest_version": HEAD_POLY_VERSION if head_poly else VERSION,
+        "construct_structure": args.structure,
         "flank_sequence": flank,
-        "flank_status": "provisional_cross_checked"
-        if flank_validated
-        else "unverified",
+        "flank_status": (
+            "not_applicable_no_flank"
+            if head_poly
+            else "provisional_cross_checked"
+            if flank_validated
+            else "unverified"
+        ),
         "flank_qc_reason": flank_reason,
         "0A_candidate_reads": len(candidates),
         "cross_length_flank_support": dict(cross_lengths),
         "seed": args.seed,
-        "input_policy": "post_head_called_signal_right_padded",
+        "balancing": {
+            "mode": "strict_length_type_zero_orientation"
+            if strict_balance
+            else "independent_caps"
+            if head_poly
+            else "legacy_positive_minimum",
+            "requested_per_group": args.per_group,
+            "effective_per_group": min(selected_group_counts.values())
+            if strict_balance
+            else None,
+            "zero_nt_grouping": "orientation" if strict_balance else "pooled",
+        },
+        "input_policy": (
+            "post_head_raw_edge_candidate_right_padded"
+            if head_poly
+            else "post_head_called_signal_right_padded"
+        ),
+        "poly_endpoint_verified": False if head_poly else None,
         "head_excluded_reads": sum(row["head_excluded"] == "true" for row in selected),
         "padded_reads": sum(
             row["chunk_end_sample"] - row["chunk_start_sample"]
@@ -675,11 +988,47 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         },
         "inputs": [str(path) for path in (bonito, dorado, reference, pod5_dir)],
         "scan_counts": dict(counts),
+        "metadata_collection": {
+            "stop_when_full": args.stop_when_full,
+            "quota_reached": quota_reached,
+            "final_quotas_met": _metadata_quotas_met(
+                group_counts,
+                target_groups,
+                args.per_group,
+                cross_lengths,
+                args.min_flank_reads,
+                require_flank=not head_poly,
+            ),
+            "target_groups": [
+                f"{length}:{kind}" for length, kind in sorted(target_groups)
+            ],
+            "records_evaluated": metadata_records,
+            "records_skipped_after_quota": metadata_skipped,
+            "quota_resumptions": quota_resumptions,
+            "candidate_counts_scope": "evaluated_records_only"
+            if metadata_skipped
+            else "all_scanned_candidates",
+            "uuid_validation_scope": "full_file"
+            if args.max_records == 0
+            else "record_limit",
+            "sampling_policy": "random_within_evaluated_candidates"
+            if metadata_skipped
+            else "random_within_all_scanned_candidates",
+        },
         "audit_counts": dict(Counter(audit.values())),
         "selected_counts": dict(
             Counter(
                 f"{row['split']}:{row['nominal_length_nt']}:{row['poly_type']}"
                 for row in selected
+            )
+        ),
+        "selected_stratum_counts": dict(
+            Counter(
+                f"{row['split']}:{length}:{kind}"
+                for row in selected
+                for length, kind in [
+                    _sampling_group(row, split_zero_orientation=strict_balance)
+                ]
             )
         ),
         "supervision_counts": dict(
@@ -689,26 +1038,66 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             f"{length}:{kind}": count
             for (length, kind), count in sorted(eligible_counts.items())
         },
+        "excluded_poly_type_counts": {
+            f"{length}:{kind}": count
+            for (length, kind), count in sorted(eligible_counts.items())
+            if length > 0 and kind not in args.poly_types
+        },
         "missing_positive_strata": [
             f"{length}:{kind}"
             for length in sorted(positive_lengths)
-            for kind in ("polyA", "polyT")
+            for kind in dict.fromkeys(args.poly_types)
             if not any(
                 row["nominal_length_nt"] == length and row["poly_type"] == kind
                 for row in selected
             )
         ],
+        "quota_deficits": {
+            f"{length}:{kind}": max(
+                0, args.per_group - selected_group_counts[(length, kind)]
+            )
+            for length, kind in sorted(target_groups)
+        },
         "started_utc": started,
         "finished_utc": datetime.now(UTC).isoformat(),
         "python_version": sys.version,
         "limitations": (
-            "Construct lengths and move/anchor boundaries are weak labels, "
-            "not read-level ground truth. Head exclusion follows the accepted "
-            "Dorado boundary; alignment/move errors remain possible. Retained "
-            "signal includes possible flank and downstream background. "
-            "No formal accuracy claims."
+            (
+                "Head-poly structure supplied by the user. All targets are construct "
+                "nominal weak labels, including zero_nt. No flank was inferred. "
+                "The raw-edge candidate can include adapter/noise. "
+                "It does not establish a Poly endpoint or completeness. "
+                "Only length is supervised. "
+                "Head exclusion follows Dorado alignment/moves and is provisional. "
+                "Zero reads without real candidate signal are excluded. "
+                "No formal accuracy claims."
+            )
+            if head_poly
+            else (
+                "Construct lengths and move/anchor boundaries are weak labels, "
+                "not read-level ground truth. Head exclusion follows the accepted "
+                "Dorado boundary; alignment/move errors remain possible. Retained "
+                "signal includes possible flank and downstream background. "
+                "No formal accuracy claims."
+            )
+        )
+        + (
+            " Metadata quotas limited candidate evaluation to BAM-order subsets; "
+            "these are not a uniform sample of all eligible reads."
+            if metadata_skipped
+            else ""
         ),
     }
+    if exclusion_path is not None:
+        summary["read_exclusion"] = {
+            "path": str(exclusion_path),
+            "sha256": exclusion_sha256,
+            "requested_ids": len(excluded_ids),
+            "excluded_assigned_ids": excluded_assigned,
+            "selected_overlap": len(
+                {row["read_id"] for row in selected} & excluded_ids
+            ),
+        }
     for label, repo in (
         ("git_commit", project),
         ("bonito_commit", project / "src/bonito"),
@@ -731,6 +1120,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--work-root", type=Path)
+    parser.add_argument(
+        "--structure",
+        choices=("head-poly-flank", "head-poly"),
+        default="head-poly-flank",
+        help="head-poly selects v4 without flank inference, using length-only labels.",
+    )
+    parser.add_argument(
+        "--signal-end-policy",
+        choices=("raw-edge",),
+        help="Required for v4: raw edge bounds a candidate, not a verified Poly.",
+    )
     parser.add_argument("--bonito-bam", type=Path, required=True)
     parser.add_argument("--dorado-bam", type=Path, required=True)
     parser.add_argument("--pod5-dir", type=Path, required=True)
@@ -748,7 +1148,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-progress", action="store_true", help="Disable progress bars on stderr."
     )
     parser.add_argument("--per-group", type=int, default=1000)
+    parser.add_argument(
+        "--exclude-read-ids",
+        type=Path,
+        help="Work-root text file of UUIDs to exclude before candidate checks/quotas",
+    )
+    parser.add_argument(
+        "--strict-balance",
+        action="store_true",
+        help=(
+            "v4 with both types: require every reference positive length/type and "
+            "both zero_nt orientations; downsample all to the smallest eligible "
+            "count, capped by --per-group. Fail if any stratum has fewer than 3. "
+            "Split each stratum separately. Existing defaults remain unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--stop-when-full",
+        action="store_true",
+        help=(
+            "Pause boundary/POD5 metadata checks when every requested stratum "
+            "(including zero_nt, when referenced) reaches --per-group. Legacy v3 "
+            "also requires flank QC. Continue UUID checks; sampling uses a BAM-order "
+            "subset, not all eligible reads."
+        ),
+    )
+    parser.add_argument(
+        "--poly-types",
+        nargs="+",
+        choices=("polyA", "polyT"),
+        default=["polyA", "polyT"],
+        help=(
+            "Positive types to balance and retain; zero_nt is retained separately. "
+            "Both types still contribute to the unchanged flank quality checks."
+        ),
+    )
     parser.add_argument("--chunk-size-samples", type=int, default=12000)
+    parser.add_argument(
+        "--min-candidate-samples",
+        type=int,
+        default=12,
+        help="v4 minimum real candidate size; a technical floor, not proof of Poly.",
+    )
     parser.add_argument("--anchor-bases", type=int, default=24)
     parser.add_argument("--anchor-error-rate", type=float, default=0.1)
     parser.add_argument("--min-poly-fraction", type=float, default=0.8)
