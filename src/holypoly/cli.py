@@ -23,7 +23,10 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the holypoly argument parser."""
     parser = argparse.ArgumentParser(
         prog="holypoly",
-        description="Nanopore poly(A/T) data preparation utilities.",
+        description=(
+            "Nanopore poly(A/T) utilities. Standard training: "
+            "bash scripts/run_reference_joint.sh --help"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     doctor_parser = subparsers.add_parser(
@@ -41,7 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-root", type=Path, help="Override the writable work root."
     )
     train_parser = subparsers.add_parser(
-        "train", help="Train frozen-encoder Poly location and length heads."
+        "train",
+        help="Legacy frozen-encoder training for explicit baselines and resume.",
+        description=(
+            "Legacy frozen-encoder training. For standard length/status/basecalling "
+            "training use scripts/run_reference_joint.sh; see docs/default_workflow.md."
+        ),
     )
     train_parser.add_argument(
         "--config",

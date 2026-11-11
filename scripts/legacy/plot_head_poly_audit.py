@@ -1,4 +1,4 @@
-"""Plot the bounded raw-signal audit using the parent plotting environment."""
+"""Plot the historical v3-to-v4 signal audit in the parent environment."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def main() -> None:
         raise ValueError("data_root/work_root are required")
     root = config.paths.work_root.resolve()
     directory = (root / args.audit_dir).resolve()
-    project = Path(__file__).resolve().parents[1]
+    project = Path(__file__).resolve().parents[2]
     if (
         not directory.is_relative_to(root)
         or directory == root

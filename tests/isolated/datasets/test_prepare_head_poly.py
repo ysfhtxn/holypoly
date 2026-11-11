@@ -19,7 +19,7 @@ from holypoly.training.data import (
     collate_poly_training_examples,
     load_training_manifest,
 )
-from tests.isolated.datasets.test_prepare import HEAD, _quota_setup, alignment
+from tests.isolated.datasets.helpers import HEAD, alignment, quota_setup
 
 
 def terminal_alignment(
@@ -96,7 +96,7 @@ def test_exclusions_do_not_fill_quotas_or_request_metadata(
         terminal_alignment(index + 1, length)
         for index, length in enumerate([0] * 4 + [20] * 4 + [40] * 4)
     ]
-    args, requested = _quota_setup(tmp_path, monkeypatch, records)
+    args, requested = quota_setup(tmp_path, monkeypatch, records)
     args.structure = "head-poly"
     args.signal_end_policy = "raw-edge"
     excluded = {records[index].query_name for index in (0, 4, 8)}
@@ -123,7 +123,7 @@ def test_v4_no_flank_pipeline_masks_all_location_and_status_labels(
         terminal_alignment(102, 0, reverse=True),
         terminal_alignment(103, 0, suffix=""),
     ]
-    args, requested = _quota_setup(tmp_path, monkeypatch, records)
+    args, requested = quota_setup(tmp_path, monkeypatch, records)
     args.structure = "head-poly"
     args.signal_end_policy = "raw-edge"
     args.stop_when_full = False
@@ -181,7 +181,7 @@ def test_v4_quota_pause_needs_no_flank_and_resumes_after_duplicate(
     ]
     replacement = terminal_alignment(101, 20)
     records = prefix + [terminal_alignment(100, 40), prefix[3], replacement]
-    args, requested = _quota_setup(tmp_path, monkeypatch, records)
+    args, requested = quota_setup(tmp_path, monkeypatch, records)
     args.structure = "head-poly"
     args.signal_end_policy = "raw-edge"
     summary = module.prepare(args)
@@ -314,7 +314,7 @@ def test_strict_quota_requires_both_zero_orientations_and_handles_duplicate(
     skipped = terminal_alignment(100, 40)
     replacement = terminal_alignment(101, 0, reverse=True)
     records = prefix + [skipped, reverse_zero[0], replacement]
-    args, requested = _quota_setup(
+    args, requested = quota_setup(
         tmp_path, monkeypatch, records, poly_types=("polyA", "polyT")
     )
     args.structure = "head-poly"
@@ -357,9 +357,7 @@ def test_strict_pipeline_reports_common_count_after_shortage(
         for index, (length, kind) in enumerate(sorted(STRICT_GROUPS))
         for offset in range(3 if kind == "none:reverse" else 5)
     ]
-    args, _ = _quota_setup(
-        tmp_path, monkeypatch, records, poly_types=("polyA", "polyT")
-    )
+    args, _ = quota_setup(tmp_path, monkeypatch, records, poly_types=("polyA", "polyT"))
     args.structure = "head-poly"
     args.signal_end_policy = "raw-edge"
     args.strict_balance = True
@@ -384,9 +382,7 @@ def test_strict_pipeline_rejects_missing_zero_orientation_without_manifest(
         if kind != "none:reverse"
         for offset in range(3)
     ]
-    args, _ = _quota_setup(
-        tmp_path, monkeypatch, records, poly_types=("polyA", "polyT")
-    )
+    args, _ = quota_setup(tmp_path, monkeypatch, records, poly_types=("polyA", "polyT"))
     args.structure = "head-poly"
     args.signal_end_policy = "raw-edge"
     args.strict_balance = True
@@ -400,7 +396,7 @@ def test_strict_pipeline_rejects_missing_zero_orientation_without_manifest(
 def test_strict_balance_requires_zero_reference_construct(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    args, requested = _quota_setup(
+    args, requested = quota_setup(
         tmp_path, monkeypatch, [], poly_types=("polyA", "polyT")
     )
     (Path(args.data_root) / "heads.fa").write_text(f">2_20A\n{HEAD}\n>3_40A\n{HEAD}\n")

@@ -38,6 +38,7 @@ from holypoly.training.data import (
 )
 from holypoly.training.engine import require_single_cuda_device, set_random_seed
 from holypoly.training.launcher import resolve_training_paths
+from holypoly.training.timing_reference import load_timing_references
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--timing-reference-manifest",
+        type=Path,
+        help="Matching timing table, required only for a timing-enabled checkpoint",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -123,6 +129,7 @@ def predict_reads(
     device: torch.device,
     batch_size: int,
     show_progress: bool = False,
+    timing_references: dict[str, tuple[float, float, float]] | None = None,
 ) -> list[dict[str, Any]]:
     """Run eval/inference mode on [batch, 1, samples] float32 signal chunks.
 
@@ -137,8 +144,18 @@ def predict_reads(
 
     def flush() -> None:
         """Predict one batch and map chunk-relative intervals to raw samples."""
-        batch = collate_poly_training_examples([example for _, example in pending])
-        output = model(batch.signal.to(device), batch.raw_padding_mask.to(device))
+        batch = collate_poly_training_examples(
+            [example for _, example in pending], timing_references=timing_references
+        )
+        output = model(
+            batch.signal.to(device),
+            batch.raw_padding_mask.to(device),
+            **(
+                {"timing_reference": batch.timing_reference.to(device)}
+                if batch.timing_reference is not None
+                else {}
+            ),
+        )
         shared_logits = (
             output.location.status_logits + output.length.status_logits
         ) / 2
@@ -445,6 +462,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     set_random_seed(int(payload["random_seed"]))
     state = payload["model_state_dict"]
     head_config = head_config_from_checkpoint(payload)
+    timing_references = None
+    timing_path = getattr(args, "timing_reference_manifest", None)
+    if bool(head_config.get("use_timing_reference", False)) != (
+        timing_path is not None
+    ):
+        raise ValueError(
+            "timing-enabled checkpoint requires --timing-reference-manifest; "
+            "ordinary checkpoints must omit it"
+        )
+    if timing_path is not None:
+        timing_path = (paths.work_root / timing_path).resolve()
+        if not timing_path.is_relative_to(
+            paths.work_root
+        ) or timing_path.is_relative_to(paths.data_root):
+            raise ValueError("timing table must be inside work_root, outside raw data")
+        timing_references = load_timing_references(
+            timing_path, records, source_manifest=paths.manifest_path
+        )
+        saved_timing = (payload.get("joint_config") or {}).get(
+            "timing_reference_manifest_sha256"
+        )
+        from holypoly.datasets.prepare_sequence import sha256
+
+        if saved_timing is not None and sha256(timing_path) != saved_timing:
+            raise ValueError("evaluation timing table differs from checkpoint")
+        summary["timing_reference_manifest"] = str(timing_path)
     model = HolypolyModel(
         load_bonito_v5_model(paths.bonito_model, device=str(device)),
         **head_config,
@@ -456,7 +499,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     dataset = PolyTrainingDataset(selected, reader)
     rows = predict_reads(
-        model, dataset, device=device, batch_size=args.batch_size, show_progress=True
+        model,
+        dataset,
+        device=device,
+        batch_size=args.batch_size,
+        show_progress=True,
+        timing_references=timing_references,
     )
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:

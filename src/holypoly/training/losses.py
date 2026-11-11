@@ -1,4 +1,4 @@
-"""Independent auxiliary loss for frozen-encoder Poly training."""
+"""Masked Poly auxiliary objectives shared by joint and frozen training."""
 
 from __future__ import annotations
 

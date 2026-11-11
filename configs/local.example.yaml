@@ -4,8 +4,11 @@ paths:
   data_root: /path/to/read-only/data
   work_root: /path/to/writable/work
 
-# Training paths may also be provided through HOLYPOLY_M3_MANIFEST,
-# HOLYPOLY_BONITO_MODEL, and HOLYPOLY_M3_CHECKPOINT.
+# Standard training: pass both manifests to scripts/run_reference_joint.sh.
+# The model is shared by joint training, evaluation and inference.
+# manifest_path/checkpoint_path below are for manual evaluation or legacy training;
+# joint run outputs are selected by EXPERIMENT_ID, not checkpoint_path.
+# HOLYPOLY_M3_MANIFEST/HOLYPOLY_M3_CHECKPOINT remain legacy-compatible overrides.
 training:
   manifest_path: metadata/training-manifest.tsv
   bonito_model: models/bonito-v5

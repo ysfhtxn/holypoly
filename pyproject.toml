@@ -73,7 +73,7 @@ warn_return_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["tests/isolated"]
+norecursedirs = ["tests/isolated", "tests/legacy"]
 markers = [
     "integration: requires explicitly configured external data and model paths",
 ]

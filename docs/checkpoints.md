@@ -1,7 +1,7 @@
 # 逐 epoch checkpoint
 
-`holypoly train` 默认在每轮训练和 validation 完成后保存一个完整 epoch 快照，
-不需要新增命令行参数。若 `--checkpoint` 为 `models/experiment/heads.pt`：
+常规联合训练在每轮训练和 validation 完成后保存完整 epoch 快照。
+`EXPERIMENT_ID=experiment` 时，模型目录为 `models/experiment/`：
 
 ```text
 models/experiment/
@@ -11,12 +11,27 @@ models/experiment/
 └── heads.epoch_0003.pt
 ```
 
-快照与最新 checkpoint 使用相同格式，包含完整模型（含冻结的 Bonito）、优化器、
+快照与最新 checkpoint 使用相同格式，包含完整模型（含共享 Bonito）、优化器、
 epoch、global step、随机状态、manifest schema、模型/loss 配置和版本信息。
 只序列化一次，再复制到独立快照；每个文件均通过临时文件原子替换。
 快照与最新文件不是硬链接，后续更新不会改变以前的 epoch。
 
-## 续训与覆盖
+## 联合训练恢复
+
+```bash
+EXPERIMENT_ID=experiment EPOCHS=10 GPU_ID=0 \
+bash scripts/run_reference_joint.sh \
+  metadata/experiment/manifest.tsv \
+  metadata/experiment-reference-head/sequence_manifest.tsv --resume --dry-run
+```
+
+检查后去掉 `--dry-run`。`EPOCHS` 是目标总轮数，模型、loss 和输入来源必须一致；
+已完成的轮次不覆盖。详细恢复检查和可选 batch 调整见
+[联合训练说明](reference_joint_training.md)。联合入口不提供 `--overwrite`。
+
+## 历史冻结入口的恢复与覆盖
+
+下面的 `--checkpoint` / `--overwrite` 规则属于 `holypoly train`，不用于恢复 joint。
 
 - `--resume --checkpoint models/experiment/heads.pt --epochs 10` 继续最新进度，
   只新增尚未完成的轮次；旧快照保持不变。
@@ -35,7 +50,7 @@ epoch、global step、随机状态、manifest schema、模型/loss 配置和版�
 delta 仅在 Huber 模式比较；旧 checkpoint 缺失新字段时按原 log loss 兼容。
 更换 loss 的实验应使用新输出目录，参见[长度 loss 说明](length_losses.md)。
 
-可选 joint checkpoint 额外记录 `joint_config`（两份 manifest 及参考哈希、encoder
+常规 joint checkpoint 额外记录 `joint_config`（两份 manifest 及参考哈希、encoder
 解冻层数、学习率、CRF 权重等）。恢复必须使用对应的 joint 入口且设置一致；
 旧冻结入口会拒绝 joint checkpoint。评估可沿用现有 `training.evaluate`。
 见[联合训练说明](reference_joint_training.md)。

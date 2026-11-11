@@ -1,71 +1,75 @@
-# 当前默认数据与训练流程
+# 默认数据准备与联合训练流程
 
-2026-10-28 用户确认：以后新数据集采用 v4 长度/状态 manifest + 配套
-reference-head sequence manifest，新常规训练采用 length + status + basecalling。
-历史数据、模型和结果保留；单独长度训练、状态校准和消融仅在明确需要时使用。
+常规实验以 `scripts/run_reference_joint.sh` 为主入口。数据准备在训练前独立完成；
+已有匹配 manifest 时从预检开始，不重复扫描或重新划分 read。
 
-新训练验证/测试和绘图统一写入 `results/training_evaluation/<run>/`；
-实际 POD5 预测写入 `results/cdna_prediction/<experiment>/`。
-命名及历史续训兼容规则见 [结果目录约定](result_layout.md)。
+## 1. 配置与规模检查
 
-## 制作数据集的两个步骤
+在 `configs/local.yaml` 设置 `paths.data_root`、外部 `paths.work_root` 和
+`training.bonito_model`。原始目录只读，输出目录必须位于 work root 且尚不存在。
+示例中的 `<sample>` 和 `experiment` 换成实际输入及新实验名称。
 
-1. `holypoly.datasets.prepare`：排除 head，保留 raw-edge Poly 候选，长度目标
-   为构建标称弱标签。A/T 联合集按正长度×类型、0 nt 两方向严格均衡。
-2. `holypoly.datasets.prepare_sequence`：仅为上述 manifest 的 read 挑选参考
-   head 内部的可靠序列窗口，继承同一 split，记录源 manifest 哈希。
-   不改长度标签，不伪造 Poly 序列，也不把候选边缘当成已确认的 Poly 终点。
+准备过程读取 BAM 和所需 POD5 元数据，不加载整批 signal 或使用 GPU。
+完整扫描前报告 BAM 大小、预计时间、CPU/内存及 audit 输出大小；先用
+`--max-records 10000 --per-group 20` 和新 smoke 目录验证。
+受限 BAM 前缀缺少共同 read 或长度组不能代表全数据缺组。
 
-每个新数据集最终有一个 `manifest.tsv` 和一个匹配的 `sequence_manifest.tsv`。
-head 筛选失败会记录审计，原长度样本不会被删除；head 配套数据数量可能较少，
-不保证其类型/长度分布也均衡。先核对 accepted 数量、split、方向和失败原因。
-不能复用源自另一 manifest 的旧 sequence manifest。
+## 2. 制作 v4 长度/状态 manifest
 
-长度制作命令见 [v4 制作方法](prepare_dataset_v4.md)，配套 head 的完整筛选规则见
-[参考 head 序列监督](reference_joint_training.md)。新目录必须尚不存在。
-`--per-group` 是目标上限：当前 poly2p5per 在现有筛选规则下，40 nt polyT
-只有 577 条，严格均衡时请求 5000 条也会将各组统一缩减到 577 条。
+```bash
+PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare \
+  --config configs/local.yaml \
+  --structure head-poly --signal-end-policy raw-edge \
+  --bonito-bam basecalls/<sample>/basecalls.bam \
+  --dorado-bam dorado_calls/<sample>/dorado_basecalls.bam \
+  --pod5-dir pod5/<sample> --reference fixed_len_ref.fa \
+  --output-dir metadata/experiment \
+  --max-records 10000 --per-group 20 \
+  --poly-types polyA polyT --strict-balance --seed 20260923
+```
 
-## A/T 8078 条联合集的配套制作示例
+仅 polyA 时使用 `--poly-types polyA` 并省略 `--strict-balance`。
+两方向联合时，正长度×类型及 0 nt 两方向严格均衡；稀缺组会缩减全部组。
+检查 `summary.json` 的版本、split、实际配额、拒绝原因和标签来源。
+准备命令仍保留历史 v3 默认，日常命令必须明确写出上面的 structure 和 end policy。
+详细规则及 `--stop-when-full` 的采样限制见 [v4 制作方法](prepare_dataset_v4.md)。
 
-现有长度 manifest 已制作完成，无需重做。先生成其配套 head 数据：
+## 3. 从同一长度 manifest 制作 reference-head 序列 manifest
 
 ```bash
 PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare_sequence \
   --config configs/local.yaml \
-  --manifest metadata/poly2p5per-head-poly-v4-polyAT-balanced-5000pergroup/manifest.tsv \
-  --dorado-bam dorado_calls/poly2p5per/dorado_basecalls.bam \
+  --manifest metadata/experiment/manifest.tsv \
+  --dorado-bam dorado_calls/<sample>/dorado_basecalls.bam \
   --reference fixed_len_ref.fa \
-  --output-dir metadata/poly2p5per-head-poly-v4-polyAT-balanced-5000pergroup-reference-head \
-  --max-records 0 --dry-run
+  --output-dir metadata/experiment-reference-head \
+  --max-records 10000 --dry-run
 ```
 
-`--dry-run` 仅读取 manifest、参考及文件元数据，不扫描 BAM、不写文件。
-检查后去掉它，由用户启动实际制作：会顺序读取完整 Dorado BAM 一次，当前约
-3.12 GiB，CPU 运行，可能数分钟至数十分钟；不读 POD5 信号、不用 GPU，
-8 千条候选的 metadata 预计数 MB 至十余 MB。先查看新 `summary.json`，
-确认 train/validation 有 accepted head 窗口，再进入训练。
+`--dry-run` 仅读取 manifest、参考和文件元数据，不扫描 BAM 或写文件。
+确认规模后去掉它；需要覆盖分散的 read 时，经规模确认后使用 `--max-records 0`。
+序列标签来自参考 head 内部的可靠窗口，不生成标称长度的重复 A/T 序列。
+继承原 split 并记录源 manifest SHA256，不能复用其他长度集的旧配套 manifest。
 
-## 默认三项联合训练
+检查 accepted 数量、split 和失败原因，至少 train/validation 各有 accepted 窗口。
+head 筛选失败不删除原长度样本，也不保证配套数据仍完全均衡。
+筛选与坐标规则见[参考 head 序列监督](reference_joint_training.md)。
 
-当前新 polyA 数据集已完成两步制作：35000 条长度样本，34429 条 accepted
-reference-head 样本。长度 split 为 train/validation/test = 28000/3500/3500，
-head split 为 27538/3441/3450。先 dry-run，再去掉开关开始训练：
+## 4. 预检并启动三项联合训练
 
 ```bash
-GPU_ID=0 EPOCHS=5 \
+GPU_ID=0 EPOCHS=5 BATCH_SIZE=32 EVAL_BATCH_SIZE=4 \
 LAMBDA_LENGTH=1 LAMBDA_STATUS=1 LAMBDA_BASECALL=0.1 \
 bash scripts/run_reference_joint.sh \
-  metadata/poly2p5per-head-poly-v4-polyA-5000pergroup-20261028-164859/manifest.tsv \
-  metadata/poly2p5per-head-poly-v4-polyA-5000pergroup-20261028-164859-reference-head/sequence_manifest.tsv \
-  --dry-run
+  metadata/experiment/manifest.tsv \
+  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
 ```
 
-脚本和 `joint_command` 均默认启用 status，无需额外设置 `STATUS_SUPERVISION=1`。
-去掉 `--dry-run` 才开始训练、最佳 validation 轮次测试和绘图。物理设备由
-`GPU_ID` 选择，内部使用 `cuda:0`。默认 batch=32、head batch=1；训练读取
-所选 POD5 信号，单 GPU，可能为小时级；5 轮 checkpoint 通常需要数 GiB，
-实际空间和训练资源由启动检查报告。先 dry-run，资源不足时减小 batch。
+去掉 `--dry-run` 才训练并生成测试及图表。使用单个显式 GPU，内部为 `cuda:0`。
+真实训练读取所选 POD5 signal 和模型，可能为小时级；逐轮 checkpoint 通常为 GiB 级。
+以预检报告为准，空间或显存不足时减少训练 batch 或实验轮数。
+`EVAL_BATCH_SIZE` 只控制训练后 test 推理；未设置时继承显式的 `BATCH_SIZE`，
+二者均未设置时训练 batch=32、test batch=4，保持历史调用行为。
 
 ```text
 total_loss = 1.0 × Huber(length, nominal_length; delta=10 nt)
@@ -73,22 +77,31 @@ total_loss = 1.0 × Huber(length, nominal_length; delta=10 nt)
            + 0.1 × Bonito_native_CTC_CRF(head_signal, reference_head)
 ```
 
-使用 sum pooling；location 不监督。仅解冻 encoder 最后一层 Transformer 和
-Poly heads，原 basecalling head 保持冻结。三项系数可通过环境变量或 CLI 覆盖。
-status 当前为普通 CE，没有自动类别加权；6:1 的状态数量差仍需独立验证。
-数据增强尚未实现或默认启用。
+sum pooling；仅解冻 encoder 最后一个 Transformer 层和 Poly heads，原 CRF head 冻结。
+status 为普通 CE，系数不是类别权重。location 不监督；无 failure 训练例时不验证
+failure 检测。原始 v4 `length_only` manifest 保持原样，联合入口显式开启弱 status。
 
-默认从原 Bonito 权重和新 Poly heads 开始。只有确认 checkpoint 未见过当前
-validation/test reads 后才能设置 `INITIALIZE_FROM`；重新分 split 不会消除
-旧 checkpoint 已见过这些 reads 的事实。
+默认从原 Bonito 和新 Poly heads 开始。只有确认旧 checkpoint 未见过当前
+validation/test read 后才使用 `INITIALIZE_FROM`。重新划分 split 不能消除历史泄漏。
 
-脚本自动按最佳 validation 轮次测试和绘图。长度图使用实际 nt 数值横轴，
-仅 polyA 的预测表只显示 polyA 与 0 nt；不用为不存在的类型预留位置。
+## 5. 选轮、测试、绘图与恢复
 
-旧两项 loss 实验恢复时显式使用 `--no-supervise-status` 并保持原配置。
-`STATUS_SUPERVISION=0` 可用于明确的脚本消融，常规新训练保持默认三项 loss。
-历史 `holypoly train` 和旧消融脚本保留原实现，不是当前默认实验流程。
+脚本按最佳 validation 长度指标选择 checkpoint，再运行 test 和绘图。
+输出在 `results/training_evaluation/<run>/`，训练日志及模型在 `logs/<run>/`、
+`models/<run>/`。图使用实际 nt 横轴间距，仅显示存在的 Poly 类型，0 nt 单独标注。
+评估解释和手动命令见 [evaluate_model.md](evaluate_model.md)。
 
-评价仍针对弱标签一致性；分别报告 A/T、各长度、0 nt 两方向，重点检查
-validation 的 0 nt 召回、20 nt 误判及 100/150 nt 偏差。不将这些指标描述为
-独立逐 read 真值下的正式准确率。
+```bash
+EXPERIMENT_ID=<existing-run> EPOCHS=10 GPU_ID=0 \
+bash scripts/run_reference_joint.sh \
+  metadata/experiment/manifest.tsv \
+  metadata/experiment-reference-head/sequence_manifest.tsv --resume --dry-run
+```
+
+恢复使用原 manifest、模型及 loss 设置；`EPOCHS` 为目标总轮数。
+旧两项 loss 恢复显式设置 `STATUS_SUPERVISION=0`，不把旧实验自动改成三项。
+恢复会保留旧 epoch 和图表，新测试图表另建 resume 子目录。
+详见[联合训练说明](reference_joint_training.md)和[checkpoint](checkpoints.md)。
+
+所有长度结果均为构建弱标签一致性，不是独立逐 read 真值准确率或跨批次泛化。
+训练后的普通 cDNA 预测、独立 holdout 和工具比较见[文档索引](README.md)。

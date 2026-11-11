@@ -1,5 +1,7 @@
 # 冻结特征的状态分类验证
 
+> 可选对照实验。常规新训练使用 [run_reference_joint 主流程](default_workflow.md)。
+
 本实验用于判断已有 encoder/投影特征能否区分 0 nt 背景和 Poly。
 沿用 v4 的构建弱标签，不改 0 nt 定义、网络层、pooling、原 manifest 或旧结果。
 

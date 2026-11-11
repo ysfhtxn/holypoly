@@ -24,6 +24,7 @@ class HolypolyModel(nn.Module):
         freeze_encoder: bool = True,
         freeze_basecalling_head: bool = True,
         length_head_mode: str = "mean",
+        use_timing_reference: bool = False,
     ) -> None:
         super().__init__()
         self.head_config = {
@@ -31,11 +32,14 @@ class HolypolyModel(nn.Module):
             "hidden_features": hidden_features,
             "dropout": dropout,
         }
+        if use_timing_reference:
+            self.head_config["use_timing_reference"] = True
         self.multitask = BonitoV5MultiTaskModel(
             basecaller,
             hidden_features=hidden_features,
             dropout=dropout,
             length_head_mode=length_head_mode,
+            use_timing_reference=use_timing_reference,
         )
         self.freeze_encoder = freeze_encoder
         self.freeze_basecalling_head = freeze_basecalling_head
@@ -57,9 +61,20 @@ class HolypolyModel(nn.Module):
         return self.multitask.length_head
 
     def forward(
-        self, signal: Tensor, raw_padding_mask: Tensor | None = None
+        self,
+        signal: Tensor,
+        raw_padding_mask: Tensor | None = None,
+        *,
+        timing_reference: Tensor | None = None,
     ) -> BonitoMultiTaskOutput:
         """Return unchanged basecall scores plus location and length outputs."""
+        if timing_reference is not None:
+            return cast(
+                BonitoMultiTaskOutput,
+                self.multitask(
+                    signal, raw_padding_mask, timing_reference=timing_reference
+                ),
+            )
         return cast(BonitoMultiTaskOutput, self.multitask(signal, raw_padding_mask))
 
     def train(self, mode: bool = True) -> Self:

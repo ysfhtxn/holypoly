@@ -7,32 +7,28 @@ POD5。运行环境是 `src/bonito/.venv`，父项目不需要新增 Torch、POD
 ## 1. 训练
 
 常规新训练使用 [length + status + basecalling 默认流程](default_workflow.md)。
-下方 `holypoly train` 命令保留为历史冻结 encoder 对照。
 
-以下命令从项目根目录运行。模型目录、data root 和 work root 由本地配置提供，
-也可以使用 CLI 或已有环境变量。机器路径只保存在本地配置，不写入本说明。
+从项目根目录执行联合训练预检：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run holypoly train \
-  --config configs/local.yaml \
-  --manifest metadata/poly2p5per-train-v1/manifest.tsv \
-  --checkpoint models/poly2p5per-train-v1/heads.pt \
-  --loss-log logs/poly2p5per-train-v1/train.jsonl \
-  --epochs 1 --batch-size 32
+GPU_ID=0 EPOCHS=5 BATCH_SIZE=32 EVAL_BATCH_SIZE=4 \
+bash scripts/run_reference_joint.sh \
+  metadata/experiment/manifest.tsv \
+  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
 ```
 
-已有 checkpoint 时不要重复运行新训练；如需继续，用同样路径加
-`--epochs 10 --resume`，表示训练至总计第 10 轮。先用 validation 选择参数和轮数，
-再用 test 评估最终模型；若根据 test 结果继续调参，该集合不再是独立的最终评估集。
+确认输入和资源后去掉 `--dry-run`。脚本自动按 validation 选轮、测试和绘图。
+以下命令供手动检查某轮 checkpoint；test 不用于参数或轮次选择。
+恢复联合训练使用同一脚本的 `--resume`，不使用历史冻结 `holypoly train`。
 
 ## 2. 测试预检查
 
 ```bash
 PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.training.evaluate \
   --config configs/local.yaml \
-  --manifest metadata/poly2p5per-train-v1/manifest.tsv \
-  --checkpoint models/poly2p5per-train-v1/heads.pt \
-  --output-dir results/training_evaluation/poly2p5per-train-v1/test-epoch1 \
+  --manifest metadata/experiment/manifest.tsv \
+  --checkpoint models/experiment/heads.epoch_0001.pt \
+  --output-dir results/training_evaluation/experiment/test-epoch1 \
   --batch-size 32 --dry-run
 ```
 
@@ -46,9 +42,9 @@ PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.training.evaluate \
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
   src/bonito/.venv/bin/python -m holypoly.training.evaluate \
   --config configs/local.yaml \
-  --manifest metadata/poly2p5per-train-v1/manifest.tsv \
-  --checkpoint models/poly2p5per-train-v1/heads.pt \
-  --output-dir results/training_evaluation/poly2p5per-train-v1/test-epoch1 \
+  --manifest metadata/experiment/manifest.tsv \
+  --checkpoint models/experiment/heads.epoch_0001.pt \
+  --output-dir results/training_evaluation/experiment/test-epoch1 \
   --batch-size 32
 ```
 
@@ -57,17 +53,15 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
 输出目录必须尚不存在；再次评估时使用新的目录，例如 `test-epoch10`。
 显存不足时减小 `--batch-size`，不会改变测试集。
 
-当前 741 条 test read，按此前 validation 的 24 个 batch、约 5 秒/batch 估计，
-batch size 32 的测试可能约 2–4 分钟，加上模型初始化；该时间尚未实际测量。
-只读取这些 read 的 POD5 信号及一个 checkpoint，不扫描全体 BAM/POD5。
-输出表预计小于数 MB。
+读取量、checkpoint 大小和样本数以 dry-run 的当前 manifest 报告为准。
+实际耗时取决于 GPU、读长和磁盘；不沿用其他历史数据集的数量或耗时估计。
 
 先做少量 read 的链路检查，可另选输出目录并加 `--max-reads 32`。
 它按 manifest 顺序取前 32 条，汇总明确记录 `partial_evaluation=true`，不代表
 随机抽样或完整 test 指标。`--max-reads 0` 默认处理整个 split。
 如需分析开发数据，可用 `--split validation`；不提供 train split 推理选项。
 
-输出位于 `<work_root>/results/training_evaluation/poly2p5per-train-v1/test-epoch1/`：
+输出位于 `<work_root>/results/training_evaluation/experiment/test-epoch1/`：
 
 - `predictions.tsv`：每个 read 一行，包含标称长度、训练目标、观察序列长度、方向、
   poly 类型、监督方式、标签来源、原始回归长度、按状态解码的长度、状态置信度和
@@ -100,8 +94,8 @@ Matplotlib 已记录在根项目依赖中，使用 uv 环境运行，不依赖 C
 ```bash
 uv run python scripts/plot_training.py \
   --config configs/local.yaml \
-  --predictions results/training_evaluation/poly2p5per-train-v1/test-epoch1/predictions.tsv \
-  --output results/training_evaluation/poly2p5per-train-v1/test-epoch1/plots
+  --predictions results/training_evaluation/experiment/test-epoch1/predictions.tsv \
+  --output results/training_evaluation/experiment/test-epoch1/plots
 ```
 
 输出 `test_summary.png/.svg/.pdf` 四个面板：按标称长度的样本数量、分方向的预测
@@ -131,17 +125,14 @@ uv run python scripts/plot_training.py \
 ```bash
 uv run python scripts/plot_training.py \
   --config configs/local.yaml \
-  --log logs/poly2p5per-train-v1/train.jsonl \
-  --output results/training_evaluation/poly2p5per-train-v1/training-plots
+  --log logs/experiment/train.jsonl \
+  --output results/training_evaluation/experiment/training-plots
 ```
 
 输出最新一轮的 loss/长度误差汇总 PNG、SVG、PDF，以及源指标和绘图脚本副本。
 同时导出 `training_curves.png/.svg/.pdf`：逐 epoch 的总 loss、长度误差、定位
 准确率、共享状态准确率、定位 IoU 和 macro F1；`loss_components.*` 分别画出
-定位、log-length 和状态 loss。所有曲线保留原始逐轮值，不平滑；`epoch_metrics.tsv`
+定位、实际长度目标（如 Huber）和状态 loss；联合日志还包括 reference-head CRF/编辑率曲线。所有曲线保留原始逐轮值，不平滑；`epoch_metrics.tsv`
 及 `source_training_history.json` 保留完整指标。定位/状态指标仅覆盖有对应监督的
 样本，IoU 为 timestep 聚合，不等于最终解码区间的逐 read IoU。
 `--log` 和 `--predictions` 二选一，分别用于训练汇总和逐 read 测试图。
-
-本次开发验证使用 synthetic 信号和 CPU，另对已有外部 manifest/checkpoint 做
-dry-run；没有启动真实 test split 推理，因此还没有本批完整测试指标。

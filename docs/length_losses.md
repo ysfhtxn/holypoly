@@ -1,5 +1,7 @@
 # 可选择的长度回归 loss
 
+> 可选对照实验。常规新训练使用 [run_reference_joint 主流程](default_workflow.md)。
+
 `holypoly train --length-loss` 支持三种方式，默认继续使用 `log_smooth_l1`。
 只更改训练循环中的长度项；网络结构、原 CRF、定位/状态项、样本筛选及训练目标均不改变。
 所有 length head（`mean`、`sum`、`duration_only`、`mean_duration`）都支持这些 loss。
@@ -48,7 +50,7 @@ model:
 
 ## 一键训练、测试和画图
 
-`scripts/run_length_loss_ablation.sh` 默认固定 `mean_duration`，在 GPU 0 上分别从头
+`scripts/run_length_loss_ablation.sh` 默认固定 `mean_duration`，在 `GPU_ID` 指定的单 GPU（默认 0）上分别从头
 训练三种 loss，各 20 轮。三组共用 manifest、初始化种子和每轮 batch 顺序；
 每组按验证集 nt MAE 选择最佳轮次，测试并画图，最后生成两个对照表。
 默认不重新抽样；直接复用已有小数据集可与前面的 head 对照保持相同 read 划分。
@@ -63,9 +65,9 @@ bash scripts/run_length_loss_ablation.sh \
   "metadata/<small-v4-dataset>/manifest.tsv"
 ```
 
-第二个位置参数可指定配置文件。环境变量支持 `EPOCHS`（20）、`BATCH_SIZE`（32）、
+第二个位置参数可指定配置文件。环境变量支持 `EPOCHS`（20）、`BATCH_SIZE`（8）、
 `LEARNING_RATE`（0.001）、`SEED`（20260923）、`LENGTH_HEAD_MODE`（mean_duration）、
-`HUBER_DELTA_NT`（10）、`EXPERIMENT_ID`（自动时间戳）。
+`HUBER_DELTA_NT`（10）、`GPU_ID`（0）、`EXPERIMENT_ID`（自动时间戳）。
 若输入完整 manifest，可设置 `SUBSET_PER_GROUP=200` 先制作一个三组共享的小 manifest；
 默认 0 使用现有全部行。选样只读取 manifest，保留原 split 和全部标签。
 

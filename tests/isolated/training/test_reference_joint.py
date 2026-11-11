@@ -149,8 +149,10 @@ def test_status_opt_in_preserves_lengths_locations_padding_and_manifest() -> Non
     assert torch.isfinite(losses["status_loss"]) and losses["status_examples"] == 1
 
 
+@pytest.mark.parametrize("with_timing", [False, True])
 def test_three_loss_joint_step_updates_status_but_not_location_or_crf(
     monkeypatch: pytest.MonkeyPatch,
+    with_timing: bool,
 ) -> None:
     """CPU uses surrogate CRF; the native CUDA test below covers actual CRF."""
     import holypoly.training.joint_engine as joint_engine
@@ -158,7 +160,10 @@ def test_three_loss_joint_step_updates_status_but_not_location_or_crf(
     monkeypatch.setattr(joint_engine, "require_single_cuda_device", lambda _: None)
     torch.manual_seed(17)
     model = JointHolypolyModel(
-        joint_basecaller(), hidden_features=6, length_head_mode="sum"
+        joint_basecaller(),
+        hidden_features=6,
+        length_head_mode="sum",
+        use_timing_reference=with_timing,
     )
     monkeypatch.setattr(
         model.basecaller, "loss", lambda scores, *_: scores.square().mean()
@@ -171,7 +176,13 @@ def test_three_loss_joint_step_updates_status_but_not_location_or_crf(
         weight_decay=0,
     )
     batch = collate_poly_training_examples(
-        weak_status_examples(), supervise_status=True
+        weak_status_examples(),
+        supervise_status=True,
+        timing_references=(
+            {"synthetic-0": (0, 0, 0), "synthetic-150": (2.5, 0.1, 1)}
+            if with_timing
+            else None
+        ),
     )
     weights = PolyLossWeights(lambda_location=0, length_loss="huber")
     criterion = PolyAuxiliaryLoss(weights)
@@ -203,6 +214,14 @@ def test_three_loss_joint_step_updates_status_but_not_location_or_crf(
     )
     assert result.global_step == 1 and result.losses["status_loss"] > 0
     assert sequence["basecalling_loss"] > 0
+    if with_timing:
+        assert model.length_head.timing_residual[-1].weight.grad.abs().sum() > 0
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in model.basecaller.encoder.transformer_encoder[
+                -1
+            ].parameters()
+        )
     for head in (model.location_head, model.length_head):
         assert head.status_classifier.weight.grad.abs().sum() > 0
     after = model.state_dict()
@@ -454,12 +473,15 @@ def test_joint_script_dry_run_defaults_to_three_losses_and_allows_legacy_mode(
     )
     ignored = {
         "STATUS_SUPERVISION",
+        "RESUME",
         "INITIALIZE_FROM",
         "EXPERIMENT_ID",
         "GPU_ID",
         "EPOCHS",
         "BATCH_SIZE",
         "SEQUENCE_BATCH_SIZE",
+        "PREFETCH_BATCHES",
+        "POD5_READER_CACHE_SIZE",
         "UNFREEZE_LAST_LAYERS",
         "HEAD_LEARNING_RATE",
         "ENCODER_LEARNING_RATE",
@@ -500,6 +522,8 @@ def test_joint_script_dry_run_defaults_to_three_losses_and_allows_legacy_mode(
     assert summary["joint_config"]["length_batch_size"] == 32
     assert summary["loss_config"]["length_loss"] == "huber"
     assert summary["joint_config"]["lambda_basecall"] == 0.1
+    assert summary["input_pipeline"]["prefetch_batches"] == 2
+    assert summary["input_pipeline"]["pod5_reader_cache_size"] == 8
     assert set(work.rglob("*")) == before
 
 

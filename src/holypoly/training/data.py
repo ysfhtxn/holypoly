@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import csv
 import math
-from collections.abc import Sequence
+from collections import OrderedDict
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from types import TracebackType
+from typing import Any, Protocol
 
 import torch
 from torch import Tensor
@@ -123,6 +126,7 @@ class PolyTrainingBatch:
     true_length_nt: Tensor
     status_targets: Tensor
     read_ids: tuple[str, ...]
+    timing_reference: Tensor | None = None
 
 
 class SignalReader(Protocol):
@@ -137,24 +141,66 @@ class Pod5SignalReader:
     Coordinates remain relative to the original untrimmed POD5 signal. The
     ``signal_shift`` and ``signal_scale`` values must come from the selected
     Bonito model configuration; they are deliberately not hard-coded here.
+    Optional file-handle caching is for one process only; use a context manager
+    or call ``close`` to release handles. The default disables caching.
     """
 
-    def __init__(self, *, signal_shift: float, signal_scale: float) -> None:
+    def __init__(
+        self, *, signal_shift: float, signal_scale: float, max_open_files: int = 0
+    ) -> None:
         if not math.isfinite(signal_shift):
             raise ValueError("signal_shift must be finite")
         if not math.isfinite(signal_scale) or signal_scale <= 0:
             raise ValueError("signal_scale must be finite and greater than zero")
+        if max_open_files < 0:
+            raise ValueError("max_open_files must be nonnegative")
         self.signal_shift = signal_shift
         self.signal_scale = signal_scale
+        self.max_open_files = max_open_files
+        self._readers: OrderedDict[Path, Any] = OrderedDict()
+
+    def __enter__(self) -> Pod5SignalReader:
+        """Scope optional reader caching to one process and an explicit lifetime."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Release cached file handles on success or failure."""
+        self.close()
+
+    def close(self) -> None:
+        """Close cached POD5 handles; normalized signals are never cached."""
+        while self._readers:
+            _, reader = self._readers.popitem(last=False)
+            reader.close()
+
+    @contextmanager
+    def _open_reader(self, path: Path) -> Iterator[Any]:
+        """Reuse at most max_open_files handles using least-recently-used eviction."""
+        from pod5 import Reader
+
+        if not self.max_open_files:
+            with Reader(path) as reader:
+                yield reader
+            return
+        if path not in self._readers:
+            if len(self._readers) >= self.max_open_files:
+                _, oldest = self._readers.popitem(last=False)
+                oldest.close()
+            self._readers[path] = Reader(path)
+        self._readers.move_to_end(path)
+        yield self._readers[path]
 
     def __call__(self, pod5_path: Path, read_id: str) -> Tensor:
         """Return one normalized float32 signal and never write to the POD5."""
         if not pod5_path.is_file():
             raise FileNotFoundError(f"POD5 file does not exist: {pod5_path}")
 
-        from pod5 import Reader
-
-        with Reader(pod5_path) as reader:
+        with self._open_reader(pod5_path) as reader:
             matches = list(
                 reader.reads(
                     selection=[read_id],
@@ -303,6 +349,7 @@ def collate_poly_training_examples(
     examples: Sequence[PolyTrainingExample],
     *,
     supervise_status: bool = False,
+    timing_references: Mapping[str, tuple[float, float, float]] | None = None,
 ) -> PolyTrainingBatch:
     """Collate inputs; optionally use manifest status independently of location.
 
@@ -361,6 +408,14 @@ def collate_poly_training_examples(
             dtype=torch.long,
         ),
         read_ids=tuple(example.record.read_id for example in examples),
+        timing_reference=(
+            torch.tensor(
+                [timing_references[example.record.read_id] for example in examples],
+                dtype=torch.float32,
+            )
+            if timing_references is not None
+            else None
+        ),
     )
 
 

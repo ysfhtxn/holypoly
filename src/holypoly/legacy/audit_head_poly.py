@@ -1,4 +1,4 @@
-"""Sample existing manifests to inspect head-to-terminal raw signal before v4.
+"""Historical v3-to-v4 audit of head-to-terminal raw signal.
 
 This bounded audit does not infer a Poly endpoint, completeness, or new labels.
 Run in the Bonito environment; its waveform summaries can be plotted separately

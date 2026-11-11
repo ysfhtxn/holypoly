@@ -21,6 +21,7 @@ from holypoly.training.engine import (
     validate_one_epoch,
 )
 from holypoly.training.losses import PolyAuxiliaryLoss
+from holypoly.training.prefetch import prefetch_batches as ordered_prefetch
 from holypoly.training.sequence_data import SequenceExample
 
 
@@ -87,6 +88,18 @@ def validate_sequences(
     batches: Iterable[Sequence[SequenceExample]],
     *,
     device: torch.device,
+    prefetch_batches: int = 0,
+) -> dict[str, float | int]:
+    """Evaluate sequence chunks with optional bounded CPU prefetch."""
+    with ordered_prefetch(batches, prefetch_batches) as prepared:
+        return _validate_sequences(model, prepared, device=device)
+
+
+def _validate_sequences(
+    model: JointHolypolyModel,
+    batches: Iterable[Sequence[SequenceExample]],
+    *,
+    device: torch.device,
 ) -> dict[str, float | int]:
     """Evaluate all accepted held-out head chunks, including decoded edit rate."""
     require_single_cuda_device(device)
@@ -127,6 +140,39 @@ def train_joint_epoch(
     gradient_clip_norm: float,
     global_step: int,
     progress_desc: str | None = None,
+    prefetch_batches: int = 0,
+) -> tuple[EpochResult, dict[str, float | int]]:
+    """Prefetch independent CPU streams while keeping joint GPU updates ordered."""
+    with (
+        ordered_prefetch(length_batches, prefetch_batches) as lengths,
+        ordered_prefetch(sequence_batches, prefetch_batches) as sequences,
+    ):
+        return _train_joint_epoch(
+            model,
+            lengths,
+            sequences,
+            criterion,
+            optimizer,
+            lambda_basecall=lambda_basecall,
+            device=device,
+            gradient_clip_norm=gradient_clip_norm,
+            global_step=global_step,
+            progress_desc=progress_desc,
+        )
+
+
+def _train_joint_epoch(
+    model: JointHolypolyModel,
+    length_batches: Iterable[PolyTrainingBatch],
+    sequence_batches: Iterable[Sequence[SequenceExample]],
+    criterion: PolyAuxiliaryLoss,
+    optimizer: Any,
+    *,
+    lambda_basecall: float,
+    device: torch.device,
+    gradient_clip_norm: float,
+    global_step: int,
+    progress_desc: str | None = None,
 ) -> tuple[EpochResult, dict[str, float | int]]:
     """One optimizer update combines length gradients and head-sequence gradients.
 
@@ -145,7 +191,15 @@ def train_joint_epoch(
     ):
         device_batch = _batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        output = model(device_batch.signal, device_batch.raw_padding_mask)
+        output = model(
+            device_batch.signal,
+            device_batch.raw_padding_mask,
+            **(
+                {"timing_reference": device_batch.timing_reference}
+                if device_batch.timing_reference is not None
+                else {}
+            ),
+        )
         losses = criterion(
             output,
             device_batch.location_targets,
@@ -219,9 +273,13 @@ def validate_joint_epoch(
     *,
     device: torch.device,
     global_step: int,
+    prefetch_batches: int = 0,
 ) -> tuple[EpochResult, dict[str, float | int]]:
     """Evaluate all length and accepted sequence validation chunks."""
-    result = validate_one_epoch(
-        model, length_batches, criterion, device=device, global_step=global_step
+    with ordered_prefetch(length_batches, prefetch_batches) as prepared:
+        result = validate_one_epoch(
+            model, prepared, criterion, device=device, global_step=global_step
+        )
+    return result, validate_sequences(
+        model, sequence_batches, device=device, prefetch_batches=prefetch_batches
     )
-    return result, validate_sequences(model, sequence_batches, device=device)

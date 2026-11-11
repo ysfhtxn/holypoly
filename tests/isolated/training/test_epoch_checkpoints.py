@@ -12,10 +12,6 @@ import torch
 
 from holypoly.models.model import HolypolyModel
 from holypoly.training import command, engine
-from holypoly.training.command import (
-    _validate_epoch_checkpoint_paths,
-    _validate_output_state,
-)
 from holypoly.training.engine import (
     CheckpointContext,
     EpochResult,
@@ -26,6 +22,10 @@ from holypoly.training.engine import (
     save_checkpoint,
 )
 from holypoly.training.losses import PolyLossWeights
+from holypoly.training.run_validation import (
+    validate_epoch_checkpoint_paths,
+    validate_output_state,
+)
 from tests.isolated.helpers import tiny_v5_basecaller
 from tests.isolated.training.test_command import FIELDNAMES, _row
 
@@ -106,14 +106,14 @@ def test_fresh_runs_protect_archives_and_explicit_overwrite_clears_only_owned_fi
     other = tmp_path / "other.epoch_0007.pt"
     other.write_bytes(b"other-run")
     with pytest.raises(ValueError, match="training output already exists"):
-        _validate_output_state(
+        validate_output_state(
             checkpoint_path=latest,
             loss_log_path=loss_log,
             resume=False,
             overwrite=False,
         )
     assert archive.read_bytes() == b"old-epoch"
-    _validate_output_state(
+    validate_output_state(
         checkpoint_path=latest, loss_log_path=loss_log, resume=False, overwrite=True
     )
     assert not archive.exists()
@@ -136,7 +136,7 @@ def test_epoch_preflight_rejects_unsafe_symlinks(
         ValueError,
         match=f"{'inside data_root' if destination == 'data' else 'inside work_root'}",
     ):
-        _validate_epoch_checkpoint_paths(
+        validate_epoch_checkpoint_paths(
             latest, start_epoch=0, epochs=1, data_root=data_root, work_root=work_root
         )
     assert target.read_bytes() == b"untouched"
@@ -150,12 +150,12 @@ def test_resume_preflight_retains_completed_epochs_and_rejects_future_collisions
     work_root.mkdir()
     latest = work_root / "heads.pt"
     epoch_checkpoint_path(latest, 1).write_bytes(b"completed")
-    _validate_epoch_checkpoint_paths(
+    validate_epoch_checkpoint_paths(
         latest, start_epoch=1, epochs=3, data_root=data_root, work_root=work_root
     )
     epoch_checkpoint_path(latest, 3).write_bytes(b"future")
     with pytest.raises(FileExistsError, match="epoch checkpoint already exists"):
-        _validate_epoch_checkpoint_paths(
+        validate_epoch_checkpoint_paths(
             latest, start_epoch=1, epochs=3, data_root=data_root, work_root=work_root
         )
     assert epoch_checkpoint_path(latest, 1).read_bytes() == b"completed"

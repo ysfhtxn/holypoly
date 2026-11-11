@@ -1,5 +1,7 @@
 # 长度头三组对照
 
+> 可选对照实验。常规新训练使用 [run_reference_joint 主流程](default_workflow.md)。
+
 三组复用同一份已有 manifest，不重新制作数据，不修改标签、原有实验或 Bonito。
 默认仍为 `mean`，原 `PolyLengthHead` 的结构、参数名和计算保持不变。
 
@@ -94,7 +96,7 @@ PYTHONPATH=src .venv/bin/python -m holypoly.datasets.subset_manifest \
 已完成默认 5 轮的三组实验，可以复制第 5 轮起点到新目录并继续训练至总计 20 轮：
 
 ```bash
-bash scripts/resume_length_head_ablation.sh <source-experiment-id>
+bash scripts/legacy/resume_length_head_ablation.sh <source-experiment-id>
 ```
 
 原 manifest、权重、日志、测试和图表全部保留。新目录包含原 1–5 轮日志和新 6–20 轮记录；

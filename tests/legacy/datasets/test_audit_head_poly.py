@@ -12,7 +12,7 @@ import numpy as np
 import pod5
 import pytest
 
-from holypoly.datasets.audit_head_poly import audit, sample_manifest, waveform_preview
+from holypoly.legacy.audit_head_poly import audit, sample_manifest, waveform_preview
 
 
 def test_sampling_is_reproducible_and_per_length(tmp_path: Path) -> None:

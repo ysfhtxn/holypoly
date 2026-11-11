@@ -10,6 +10,7 @@ import re
 import sys
 from collections import Counter
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
@@ -25,15 +26,6 @@ from holypoly.core.result_paths import training_result_dir
 from holypoly.datasets.prepare_sequence import sha256
 from holypoly.models.joint_model import JointHolypolyModel, create_joint_optimizer
 from holypoly.models.model import head_config_from_checkpoint, load_bonito_v5_model
-from holypoly.training.command import (
-    _git_commit,
-    _manifest_summary,
-    _single_manifest_version,
-    _validate_epoch_checkpoint_paths,
-    _validate_manifest_sources,
-    _validate_output_state,
-    _validate_paths,
-)
 from holypoly.training.data import (
     ManifestSplit,
     Pod5SignalReader,
@@ -48,6 +40,7 @@ from holypoly.training.engine import (
     require_single_cuda_device,
     save_checkpoint,
     set_random_seed,
+    validate_joint_config,
 )
 from holypoly.training.joint_engine import (
     joint_log_record,
@@ -57,15 +50,91 @@ from holypoly.training.joint_engine import (
 )
 from holypoly.training.loss_config import normalize_loss_config
 from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
+from holypoly.training.run_validation import (
+    git_commit,
+    manifest_summary,
+    single_manifest_version,
+    validate_epoch_checkpoint_paths,
+    validate_manifest_sources,
+    validate_output_state,
+    validate_training_paths,
+)
 from holypoly.training.sequence_data import (
     SequenceDataset,
     collate_sequence_examples,
     load_sequence_manifest,
 )
+from holypoly.training.timing_reference import load_timing_references
+
+
+def _validate_resume_metadata(
+    payload: dict[str, Any],
+    *,
+    log: Path,
+    result_dir: Path,
+    joint_config: dict[str, Any],
+    target_epochs: int,
+    allow_batch_size_change: bool,
+    recorded_utc: str,
+) -> list[dict[str, Any]]:
+    """Validate mixed-batch epoch history without rewriting any completed records."""
+    saved_config = payload.get("joint_config")
+    validate_joint_config(
+        saved_config, joint_config, allow_batch_size_change=allow_batch_size_change
+    )
+    epoch, step = payload["epoch"], payload["global_step"]
+    if target_epochs <= epoch:
+        raise ValueError("resume target epochs must exceed checkpoint epoch")
+    if not log.is_file():
+        raise ValueError("resume requires the existing complete training log")
+    history = [json.loads(line) for line in log.read_text().splitlines()]
+    expected = [
+        (index, split)
+        for index in range(1, epoch + 1)
+        for split in ("train", "validation")
+    ]
+    if (
+        [(row["epoch"], row["split"]) for row in history] != expected
+        or history[-1]["global_step"] != step
+        or history[-1].get("joint_config") != saved_config
+    ):
+        raise ValueError("training log and resume checkpoint are inconsistent")
+    for index in range(0, len(history), 2):
+        train_config = history[index].get("joint_config")
+        if train_config != history[index + 1].get("joint_config"):
+            raise ValueError("training/validation joint configurations differ")
+        # Older epochs retain their actual batch size, even on a later strict resume.
+        validate_joint_config(train_config, saved_config, allow_batch_size_change=True)
+    if not (result_dir / "basecalling_validation_baseline.json").is_file():
+        raise ValueError("resume requires the original basecalling validation baseline")
+    summary_path = result_dir / "run_summary.json"
+    if not summary_path.is_file():
+        raise ValueError("resume requires the original run summary")
+    original_summary = json.loads(summary_path.read_text())
+    # Summary may predate the latest saved epoch if a continuation was interrupted.
+    validate_joint_config(
+        original_summary.get("joint_config"),
+        saved_config,
+        allow_batch_size_change=True,
+    )
+    changes = list(payload.get("length_batch_size_changes", []))
+    old_size = saved_config["length_batch_size"]
+    new_size = joint_config["length_batch_size"]
+    if old_size != new_size:
+        changes.append(
+            {
+                "after_epoch": epoch,
+                "global_step": step,
+                "from_batch_size": old_size,
+                "to_batch_size": new_size,
+                "recorded_utc": recorded_utc,
+            }
+        )
+    return changes
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Keep the experimental joint path separate from the frozen train command."""
+    """Expose the standard joint workflow and explicit legacy resume switches."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -81,12 +150,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compatible frozen sum/Huber checkpoint; optimizer starts fresh",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-batch-size-change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Allow length --batch-size changes on resume (default); "
+            "use --no-allow-batch-size-change for strict matching"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--sequence-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=2,
+        help="CPU batches queued per length/sequence stream; 0 disables prefetch",
+    )
+    parser.add_argument(
+        "--pod5-reader-cache-size",
+        type=int,
+        default=8,
+        help="Maximum open POD5 readers per stream; 0 disables handle reuse",
+    )
     parser.add_argument("--chunk-size-samples", type=int, default=12000)
     parser.add_argument("--hidden-features", type=int, default=128)
+    parser.add_argument(
+        "--use-timing-reference",
+        action="store_true",
+        help="Ordinary-window timing fusion (default off); requires an audited table",
+    )
+    parser.add_argument("--timing-reference-manifest", type=Path)
     parser.add_argument("--head-learning-rate", type=float, default=0.001)
     parser.add_argument("--encoder-learning-rate", type=float, default=0.00001)
     parser.add_argument("--lambda-basecall", type=float, default=0.1)
@@ -110,9 +206,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    """Run joint training while releasing prefetched readers on success or failure."""
+    with ExitStack() as resources:
+        return _run(args, resources)
+
+
+def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
     """Validate both manifests before reading model weights, then train one GPU."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.run_id):
         raise ValueError("run-id must be one directory name")
+    if args.prefetch_batches < 0 or args.pod5_reader_cache_size < 0:
+        raise ValueError(
+            "prefetch-batches and pod5-reader-cache-size must be nonnegative"
+        )
     for key in (
         "epochs",
         "batch_size",
@@ -178,7 +284,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             or path in (manifest, sequence_path)
         ):
             raise ValueError("unsafe joint output path")
-    _validate_paths(
+    validate_training_paths(
         data_root=data,
         work_root=work,
         manifest_path=manifest,
@@ -186,7 +292,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint_path=checkpoint,
         loss_log_path=log,
     )
-    _validate_output_state(
+    validate_output_state(
         checkpoint_path=checkpoint,
         loss_log_path=log,
         resume=args.resume,
@@ -204,7 +310,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ):
             raise ValueError("initialization checkpoint must exist inside work_root")
     records = load_training_manifest(manifest)
-    _validate_manifest_sources(records, data_root=data)
+    validate_manifest_sources(records, data_root=data)
     if any(
         r.supervision_mode.value != "length_only"
         or r.manifest_version != "construct-nominal-head-poly-v4"
@@ -216,6 +322,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     sequence_records = load_sequence_manifest(
         sequence_path, records, source_manifest_sha256=sha256(manifest), data_root=data
     )
+    timing_references = None
+    timing_path = None
+    if args.use_timing_reference != (args.timing_reference_manifest is not None):
+        raise ValueError(
+            "use --use-timing-reference together with --timing-reference-manifest"
+        )
+    if args.use_timing_reference:
+        timing_path = (work / args.timing_reference_manifest).resolve()
+        if not timing_path.is_relative_to(work) or timing_path.is_relative_to(data):
+            raise ValueError("timing table must be inside work_root, outside raw data")
+        timing_references = load_timing_references(
+            timing_path, records, source_manifest=manifest
+        )
     sequence_counts = Counter(r.split.value for r in sequence_records)
     if not sequence_counts["train"] or not sequence_counts["validation"]:
         raise ValueError(
@@ -297,6 +416,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             location_supervision=False,
         )
+    if timing_path is not None:
+        joint_config.update(
+            use_timing_reference=True,
+            timing_reference_manifest=str(timing_path),
+            timing_reference_manifest_sha256=sha256(timing_path),
+            timing_reference_summary_sha256=sha256(timing_path.parent / "summary.json"),
+        )
     summary = {
         "started_utc": datetime.now(UTC).isoformat(),
         "command": [
@@ -309,8 +435,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         },
-        **_manifest_summary(records, epochs=args.epochs),
+        **manifest_summary(records, epochs=args.epochs),
         "joint_config": joint_config,
+        "input_pipeline": {
+            "prefetch_batches": args.prefetch_batches,
+            "pod5_reader_cache_size": args.pod5_reader_cache_size,
+            "backend": "ordered_cpu_threads",
+        },
         "loss_config": asdict(weights),
         "sequence_split_counts": dict(sequence_counts),
         "status_supervision_enabled": args.supervise_status,
@@ -323,6 +454,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "not independent read truth or cross-batch generalization."
         ),
     }
+    if timing_references is not None:
+        summary["timing_reference_coverage"] = {
+            split.value: {
+                "reads": sum(r.split == split for r in records),
+                "available": sum(
+                    timing_references[r.read_id][2] == 1
+                    for r in records
+                    if r.split == split
+                ),
+            }
+            for split in ManifestSplit
+        }
+    resume_position = None
+    batch_size_changes: list[dict[str, Any]] = []
+    if args.resume:
+        # mmap touches metadata only here; no GPU allocation or POD5 signal reads.
+        payload = torch.load(
+            checkpoint, map_location="cpu", mmap=True, weights_only=False
+        )
+        batch_size_changes = _validate_resume_metadata(
+            payload,
+            log=log,
+            result_dir=result_dir,
+            joint_config=joint_config,
+            target_epochs=args.epochs,
+            allow_batch_size_change=args.allow_batch_size_change,
+            recorded_utc=summary["started_utc"],
+        )
+        resume_position = (payload["epoch"], payload["global_step"])
+        del payload
+        summary["length_batch_size_changes"] = batch_size_changes
+        if batch_size_changes:
+            print(
+                "Length batch size changes are recorded. One sequence batch per "
+                "length update is unchanged; sequence updates per epoch therefore "
+                "depend on length batch size. Learning rates are not rescaled.",
+                file=sys.stderr,
+                flush=True,
+            )
     print(json.dumps(summary, sort_keys=True), flush=True)
     print(
         "Single selected GPU; partial encoder backward increases memory use. "
@@ -355,9 +525,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         os.environ[name] = str(cache)
     set_random_seed(args.random_seed)
     standard = model_config["standardisation"]
-    reader = Pod5SignalReader(
-        signal_shift=float(standard["mean"]), signal_scale=float(standard["stdev"])
-    )
+    # Independent readers avoid concurrent access to the same cached POD5 handle.
+    reader_options = {
+        "signal_shift": float(standard["mean"]),
+        "signal_scale": float(standard["stdev"]),
+        "max_open_files": args.pod5_reader_cache_size,
+    }
+    reader = resources.enter_context(Pod5SignalReader(**reader_options))
+    sequence_reader = resources.enter_context(Pod5SignalReader(**reader_options))
     length_generators = torch.Generator(), torch.Generator()
     loaders = {}
     for split in (ManifestSplit.TRAIN, ManifestSplit.VALIDATION):
@@ -369,7 +544,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             shuffle=split == ManifestSplit.TRAIN,
             generator=length_generators[0] if split == ManifestSplit.TRAIN else None,
             collate_fn=partial(
-                collate_poly_training_examples, supervise_status=args.supervise_status
+                collate_poly_training_examples,
+                supervise_status=args.supervise_status,
+                timing_references=timing_references,
             ),
             num_workers=0,
         )
@@ -377,7 +554,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for split in (ManifestSplit.TRAIN, ManifestSplit.VALIDATION, ManifestSplit.TEST):
         if sequence_counts[split.value]:
             sequence_loaders[split] = DataLoader(
-                SequenceDataset(sequence_records, reader, split=split),
+                SequenceDataset(sequence_records, sequence_reader, split=split),
                 batch_size=args.sequence_batch_size,
                 shuffle=split == ManifestSplit.TRAIN,
                 generator=length_generators[1]
@@ -392,6 +569,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         length_head_mode="sum",
         hidden_features=args.hidden_features,
         dropout=0.0,
+        use_timing_reference=args.use_timing_reference,
     ).to(device)
     optimizer = create_joint_optimizer(
         model,
@@ -415,7 +593,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             or payload["model_config"] != model_config
             or payload.get("joint_config") is not None
-            or payload["manifest_schema_version"] != _single_manifest_version(records)
+            or payload["manifest_schema_version"] != single_manifest_version(records)
         ):
             raise ValueError(
                 "initialization must match frozen sum/Huber model configuration"
@@ -438,35 +616,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             data_order_seed=args.random_seed,
             loss_weights=weights,
             joint_config=joint_config,
+            allow_batch_size_change=args.allow_batch_size_change,
         )
         start_epoch, step = state.epoch, state.global_step
-        if start_epoch >= args.epochs:
-            raise ValueError("resume target epochs must exceed checkpoint epoch")
-        if not log.is_file():
-            raise ValueError("resume requires the existing complete training log")
-        history = [json.loads(line) for line in log.read_text().splitlines()]
-        expected = [
-            (epoch, split)
-            for epoch in range(1, start_epoch + 1)
-            for split in ("train", "validation")
-        ]
-        if (
-            [(row["epoch"], row["split"]) for row in history] != expected
-            or any(row.get("joint_config") != joint_config for row in history)
-            or history[-1]["global_step"] != step
-        ):
-            raise ValueError("training log and resume checkpoint are inconsistent")
-        if not (result_dir / "basecalling_validation_baseline.json").is_file():
-            raise ValueError(
-                "resume requires the original basecalling validation baseline"
-            )
-        summary_path = result_dir / "run_summary.json"
-        if not summary_path.is_file():
-            raise ValueError("resume requires the original run summary")
-        original_summary = json.loads(summary_path.read_text())
-        if original_summary.get("joint_config") != joint_config:
-            raise ValueError("original run summary has a different joint configuration")
-    _validate_epoch_checkpoint_paths(
+        if (start_epoch, step) != resume_position:
+            raise ValueError("resume checkpoint changed after metadata preflight")
+    validate_epoch_checkpoint_paths(
         checkpoint,
         start_epoch=start_epoch,
         epochs=args.epochs,
@@ -480,7 +635,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary["parameter_counts"] = model.parameter_counts()
     if not args.resume:
         baseline = validate_sequences(
-            model, sequence_loaders[ManifestSplit.VALIDATION], device=device
+            model,
+            sequence_loaders[ManifestSplit.VALIDATION],
+            device=device,
+            prefetch_batches=args.prefetch_batches,
         )
         baseline_path.write_text(
             json.dumps(
@@ -493,13 +651,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     context = CheckpointContext(
         random_seed=args.random_seed,
-        bonito_commit=_git_commit(project / "src" / "bonito"),
-        git_commit=_git_commit(project),
+        bonito_commit=git_commit(project / "src" / "bonito"),
+        git_commit=git_commit(project),
         model_config=model_config,
-        manifest_schema_version=_single_manifest_version(records),
+        manifest_schema_version=single_manifest_version(records),
         loss_weights=weights,
         data_order_seed=args.random_seed,
         joint_config=joint_config,
+        length_batch_size_changes=tuple(batch_size_changes),
+        input_pipeline=summary["input_pipeline"],
     )
     criterion = PolyAuxiliaryLoss(weights)
     for epoch in range(start_epoch + 1, args.epochs + 1):
@@ -516,6 +676,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             gradient_clip_norm=args.gradient_clip_norm,
             global_step=step,
             progress_desc=f"Joint epoch {epoch}/{args.epochs}",
+            prefetch_batches=args.prefetch_batches,
         )
         step = training.global_step
         validation, val_sequence = validate_joint_epoch(
@@ -525,6 +686,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             criterion,
             device=device,
             global_step=step,
+            prefetch_batches=args.prefetch_batches,
         )
         with log.open("a") as stream:
             for split_name, metrics, seq in (
@@ -579,7 +741,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "epoch": best["epoch"],
                 "validation_mae_nt": best["length_mae_nt"],
                 "checkpoint": str(best_path),
-                "joint_config": joint_config,
+                "joint_config": best["joint_config"],
                 "loss_config": asdict(weights),
             },
             indent=2,
@@ -593,7 +755,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             model.load_state_dict(payload["model_state_dict"], strict=True)
             del payload
             test = validate_sequences(
-                model, sequence_loaders[ManifestSplit.TEST], device=device
+                model,
+                sequence_loaders[ManifestSplit.TEST],
+                device=device,
+                prefetch_batches=args.prefetch_batches,
             )
             with test_path.open("x") as stream:
                 stream.write(

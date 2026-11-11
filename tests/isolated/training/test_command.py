@@ -5,13 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from holypoly.training.command import _validate_manifest_sources, main
+from holypoly.training.command import main
 from holypoly.training.data import (
     ManifestLabelStatus,
     ManifestPolyType,
     ManifestSplit,
     PolyTrainingRecord,
 )
+from holypoly.training.run_validation import validate_manifest_sources
 
 FIELDNAMES = [
     "manifest_version",
@@ -219,4 +220,4 @@ def test_train_and_validation_reject_duplicate_read_id(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="share read_id values: duplicate-read"):
-        _validate_manifest_sources(records, data_root=data_root)
+        validate_manifest_sources(records, data_root=data_root)

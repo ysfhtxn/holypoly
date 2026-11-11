@@ -4,7 +4,7 @@ set -euo pipefail
 
 if [[ $# -eq 0 || "${1:-}" == "--help" ]]; then
   cat <<'HELP'
-Usage: bash scripts/resume_length_head_ablation.sh <source-experiment-id> [config.yaml]
+Usage: bash scripts/legacy/resume_length_head_ablation.sh <source-experiment-id> [config.yaml]
 Copy each epoch-5 checkpoint and log into new directories, then resume to epoch 20.
 Use the same small manifest, model settings, data-order seed and physical GPU 0.
 Select the lowest validation MAE across epochs 1-20, then test and plot it.
@@ -13,7 +13,7 @@ HELP
   exit 0
 fi
 
-PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 SOURCE_EXPERIMENT="$1"
 CONFIG="${2:-configs/local.yaml}"

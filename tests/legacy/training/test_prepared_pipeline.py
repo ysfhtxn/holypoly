@@ -1,4 +1,4 @@
-"""Opt-in checks on a prepared manifest and a trained real-model checkpoint."""
+"""Opt-in historical integration for frozen mean-head checkpoints, not joint runs."""
 
 from __future__ import annotations
 

@@ -1,7 +1,8 @@
-# 构建级弱监督训练集
+# 历史 v3：构建级弱监督训练集
 
-> 已确认无 flank 的 head–Poly 构建请使用 [v4 制作方法](prepare_dataset_v4.md)。
-> 下方原有命令和双锚点规则说明的是 v3 历史流程。
+> 本文合并原 v3 制作说明，供历史实验复现使用。
+> 新数据使用 [v4 制作方法](../prepare_dataset_v4.md) 和
+> [联合训练主流程](../default_workflow.md)，不沿用本文的 flank 假设。
 
 脚本：`src/holypoly/datasets/prepare.py`。在 Bonito 独立环境运行，无新增依赖，
 不加载模型、不使用 GPU、不修改原始文件。
@@ -15,6 +16,7 @@
 ```bash
 PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare \
   --config configs/local.yaml \
+  --structure head-poly-flank \
   --bonito-bam basecalls/poly2p5per/basecalls.bam \
   --dorado-bam dorado_calls/poly2p5per/dorado_basecalls.bam \
   --pod5-dir pod5/poly2p5per \
@@ -52,6 +54,7 @@ CPU 内存取决于 UUID 和合格候选数，百万 read 预计需要数 GB；H
 ```bash
 PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare \
   --config configs/local.yaml \
+  --structure head-poly-flank \
   --bonito-bam basecalls/poly2p5per/basecalls.bam \
   --dorado-bam dorado_calls/poly2p5per/dorado_basecalls.bam \
   --pod5-dir pod5/poly2p5per \
@@ -219,14 +222,15 @@ length_only 样本可能包含截断 Poly，其标称目标存在额外噪声；
 一轮，再用 `--epochs 2 --resume` 检查 checkpoint 恢复。模型、manifest 和
 checkpoint 路径均由配置、CLI 或环境变量提供，不将真实文件放入仓库。
 
-`tests/isolated/training/test_prepared_pipeline.py` 是独立的 opt-in integration test。
+`tests/legacy/training/test_prepared_pipeline.py` 是冻结训练的历史 integration test，
+不参与默认测试，也不适用于 joint checkpoint。
 显式设置 `HOLYPOLY_DATA_ROOT`、`HOLYPOLY_WORK_ROOT`、`HOLYPOLY_M3_MANIFEST`、
 `HOLYPOLY_BONITO_MODEL` 和 `HOLYPOLY_M3_CHECKPOINT`，再运行：
 
 ```bash
 CUDA_VISIBLE_DEVICES=<physical-gpu-id> PYTHONPATH=src \
   src/bonito/.venv/bin/python -m pytest -q \
-  tests/isolated/training/test_prepared_pipeline.py -m integration
+  tests/legacy/training/test_prepared_pipeline.py -m integration
 ```
 
 该测试读取各 split 的真实 POD5，检查混合监督 forward/backward、冻结 encoder
@@ -235,8 +239,8 @@ CUDA_VISIBLE_DEVICES=<physical-gpu-id> PYTHONPATH=src \
 `test_predictions.tsv`。test split 只导出预测，不进行 optimizer 更新。
 缺少外部路径时明确跳过；必须只暴露一个 GPU。Torch、Triton、CUDA 的运行缓存
 也应通过对应环境变量指向 work root 的 cache 子目录。
-已有 `test_real_2p5per_pipeline_smoke` 专门测试旧固定 manifest；测试新的 v3 数据时
-应调用上述文件，避免将新 manifest 套入旧 fixture 的断言。
+旧固定 manifest 的 `test_real_2p5per_pipeline_smoke` 已移到
+`tests/legacy/training/test_milestone3_smoke.py`；不要将 v3 或 joint 数据套入其断言。
 
 此前 v2 小型运行使用前 10000 条 Bonito/Dorado 记录，每个可用层抽 3 条，共 33 条；
 train/validation/test 各 11 条，完整监督 10 条、length_only 23 条。
@@ -244,3 +248,20 @@ train/validation/test 各 11 条，完整监督 10 条、length_only 23 条。
 未纳入。单 GPU 训练、恢复训练及真实数据 integration 均通过。该结果仅为
 链路 smoke test，不代表正式准确率。
 v3 目前只完成 synthetic 验证；上述真实运行结果不证明 v3 在真实数据上的行为。
+
+## 合并补充：v3 配额和质控记录
+
+原 `current_dataset_preparation.md` 的 polyA 配额方案与本文相同：正长度组共同
+下采样至可用最少量，0 nt 至多为一个正组的数量；不按 0 nt 方向单独均衡。
+`--stop-when-full` 只暂停昂贵元数据检查，余下 UUID 仍检查；重复 primary 使配额
+失效时恢复检查。候选来自已检查的 BAM 顺序范围，不是全数据均匀抽样。
+
+复现时检查 `selected_counts`、`supervision_counts`、`eligible_counts`、
+`excluded_poly_type_counts`、`missing_positive_strata`、`flank_status`、
+`flank_qc_reason`、`cross_length_flank_support`、`metadata_collection`、
+`head_excluded_reads`、`padded_reads` 和 `audit_counts`。这些计数只描述已检查范围，
+不能据此声称全数据保留率、边界正确或模型准确率。
+
+重点审计很短信号却赋较长标称目标、观察与标称长度差异、full 比例、0 nt 方向
+及 BAM 顺序偏差。训练/验证/测试按 read ID 隔离，历史 test 若用于调参则不再是
+最终独立评估集。仅 polyA 训练不能证明 polyT 能力。

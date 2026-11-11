@@ -30,13 +30,6 @@ from holypoly.models.model import (
     load_bonito_v5_model,
 )
 from holypoly.models.poly_heads import ReadStatus
-from holypoly.training.command import (
-    _git_commit,
-    _manifest_summary,
-    _single_manifest_version,
-    _validate_manifest_sources,
-    _validate_paths,
-)
 from holypoly.training.data import (
     ManifestSplit,
     Pod5SignalReader,
@@ -52,6 +45,13 @@ from holypoly.training.engine import (
     set_random_seed,
 )
 from holypoly.training.losses import PolyLossWeights
+from holypoly.training.run_validation import (
+    git_commit,
+    manifest_summary,
+    single_manifest_version,
+    validate_manifest_sources,
+    validate_training_paths,
+)
 from holypoly.training.status_training import (
     balanced_status_weights,
     extract_status_features,
@@ -147,7 +147,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("unsafe calibration output")
         if path.exists() and not args.resume:
             raise FileExistsError(f"choose a new run-id; output exists: {path}")
-    _validate_paths(
+    validate_training_paths(
         data_root=data,
         work_root=work,
         manifest_path=manifest,
@@ -156,7 +156,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         loss_log_path=log,
     )
     records = load_training_manifest(manifest)
-    _validate_manifest_sources(records, data_root=data)
+    validate_manifest_sources(records, data_root=data)
     if len({r.read_id for r in records}) != len(records):
         raise ValueError("calibration requires unique read IDs across splits")
     if any(r.manifest_version != "construct-nominal-head-poly-v4" for r in records):
@@ -180,7 +180,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ]
     class_weights = balanced_status_weights(targets)
     summary = {
-        **_manifest_summary(records, epochs=args.epochs),
+        **manifest_summary(records, epochs=args.epochs),
         "run_id": args.run_id,
         "result_dir": str(result_dir),
         "dry_run": args.dry_run,
@@ -218,7 +218,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     model_config = toml.load(model_dir / "config.toml")
     if payload["model_config"] != model_config:
         raise ValueError("source checkpoint and Bonito model configs differ")
-    if payload["manifest_schema_version"] != _single_manifest_version(records):
+    if payload["manifest_schema_version"] != single_manifest_version(records):
         raise ValueError("source checkpoint schema differs from manifest")
     source_joint = payload.get("joint_config") or {}
     if source_joint.get("length_manifest_sha256", sha256(manifest)) != sha256(manifest):
@@ -264,11 +264,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     context = CheckpointContext(
         args.random_seed,
-        _git_commit(project / "src" / "bonito"),
+        git_commit(project / "src" / "bonito"),
         model_config,
-        _single_manifest_version(records),
+        single_manifest_version(records),
         weights,
-        _git_commit(project),
+        git_commit(project),
         args.random_seed,
         calibration,
     )

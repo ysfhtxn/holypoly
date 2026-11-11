@@ -15,6 +15,8 @@ doctor:
   sample_size: 3
 
 model:
+  # Shared weights; legacy defaults below remain compatible with old experiments.
+  # run_reference_joint.sh uses sum + Huber and enables weak status supervision.
   auxiliary_loss:
     lambda_location: 1.0
     lambda_length: 1.0
@@ -23,6 +25,7 @@ model:
     huber_delta_nt: 10.0
 
 training:
+  # Frozen-entry defaults. Standard joint settings come from run_reference_joint.sh.
   manifest_path: null
   bonito_model: null
   checkpoint_path: null

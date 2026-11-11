@@ -1,5 +1,7 @@
 # 平均池化与求和池化对照
 
+> 可选对照实验。常规新训练使用 [run_reference_joint 主流程](default_workflow.md)。
+
 `--length-head-mode sum` 是独立可选模式；默认仍为原 `mean`，旧网络和旧结果保持原样。
 两者均为 LayerNorm → Linear(H) → GELU → Dropout → masked pooling → Linear → softplus。
 所有层、参数名、参数量和相同种子下的初始化一致，唯一差别是 pooling：

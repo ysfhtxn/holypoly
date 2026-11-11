@@ -1,4 +1,4 @@
-"""Opt-in last-Transformer-layer tuning; default frozen model stays unchanged."""
+"""Standard joint model with selected final Transformer blocks unfrozen."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Single-GPU training utilities for frozen Bonito Poly heads."""
+"""Shared metrics, checkpoints and single-GPU utilities for Poly training."""
 
 from __future__ import annotations
 
@@ -50,6 +50,8 @@ class CheckpointContext:
     git_commit: str
     data_order_seed: int | None = None
     joint_config: Mapping[str, Any] | None = None
+    length_batch_size_changes: tuple[Mapping[str, Any], ...] = ()
+    input_pipeline: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -145,7 +147,7 @@ def train_one_epoch(
         for batch in progress:
             device_batch = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            output = model(device_batch.signal, device_batch.raw_padding_mask)
+            output = _forward_batch(model, device_batch)
             losses = criterion(
                 output,
                 device_batch.location_targets,
@@ -193,7 +195,7 @@ def validate_one_epoch(
     ):
         for batch in progress:
             device_batch = _batch_to_device(batch, device)
-            output = model(device_batch.signal, device_batch.raw_padding_mask)
+            output = _forward_batch(model, device_batch)
             losses = criterion(
                 output,
                 device_batch.location_targets,
@@ -271,11 +273,46 @@ def save_checkpoint(
     }
     if context.joint_config is not None:
         payload["joint_config"] = dict(context.joint_config)
+    if context.length_batch_size_changes:
+        payload["length_batch_size_changes"] = list(context.length_batch_size_changes)
+    if context.input_pipeline is not None:
+        payload["input_pipeline"] = dict(context.input_pipeline)
     torch.save(payload, temporary_path)
     if archive_path is not None and archive_temporary is not None:
         shutil.copyfile(temporary_path, archive_temporary)
         archive_temporary.replace(archive_path)
     temporary_path.replace(path)
+
+
+def validate_joint_config(
+    saved: Any,
+    requested: Mapping[str, Any] | None,
+    *,
+    allow_batch_size_change: bool = False,
+) -> None:
+    """Require matching joint settings, optionally allowing only length batch size."""
+    expected = dict(requested) if requested is not None else None
+    if saved == expected:
+        return
+    if allow_batch_size_change and isinstance(saved, Mapping) and expected is not None:
+        sizes = (saved.get("length_batch_size"), expected.get("length_batch_size"))
+        if all(type(size) is int and size > 0 for size in sizes) and {
+            key: value for key, value in saved.items() if key != "length_batch_size"
+        } == {
+            key: value for key, value in expected.items() if key != "length_batch_size"
+        }:
+            return
+    differing = ""
+    if isinstance(saved, Mapping) and expected is not None:
+        keys = sorted(
+            key
+            for key in saved.keys() | expected.keys()
+            if key not in saved or key not in expected or saved[key] != expected[key]
+        )
+        differing = ": " + ", ".join(keys)
+    raise ValueError(
+        "joint training configuration differs from the checkpoint" + differing
+    )
 
 
 def load_checkpoint(
@@ -287,15 +324,18 @@ def load_checkpoint(
     data_order_seed: int | None = None,
     loss_weights: PolyLossWeights | None = None,
     joint_config: Mapping[str, Any] | None = None,
+    allow_batch_size_change: bool = False,
 ) -> ResumeState:
     """Restore model, optimizer, epoch, step, and random states."""
     require_single_cuda_device(device)
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {path}")
     payload = torch.load(path, map_location=device, weights_only=False)
-    expected_joint = dict(joint_config) if joint_config is not None else None
-    if payload.get("joint_config") != expected_joint:
-        raise ValueError("joint training configuration differs from the checkpoint")
+    validate_joint_config(
+        payload.get("joint_config"),
+        joint_config,
+        allow_batch_size_change=allow_batch_size_change,
+    )
     saved_loss_config = payload.get("loss_config")
     if not isinstance(saved_loss_config, Mapping):
         raise ValueError("checkpoint loss_config must be a mapping")
@@ -320,6 +360,10 @@ def load_checkpoint(
         keys = ("length_head_mode", "hidden_features")
     if any(head_config[key] != model.head_config[key] for key in keys):
         raise ValueError("length head configuration differs from the checkpoint")
+    if bool(head_config.get("use_timing_reference", False)) != bool(
+        model.head_config.get("use_timing_reference", False)
+    ):
+        raise ValueError("timing reference architecture differs from the checkpoint")
     model.load_state_dict(payload["model_state_dict"])
     optimizer.load_state_dict(payload["optimizer_state_dict"])
     random.setstate(payload["python_random_state"])
@@ -482,7 +526,21 @@ def _batch_to_device(
         true_length_nt=batch.true_length_nt.to(device),
         status_targets=batch.status_targets.to(device),
         read_ids=batch.read_ids,
+        timing_reference=batch.timing_reference.to(device)
+        if batch.timing_reference is not None
+        else None,
     )
+
+
+def _forward_batch(model: HolypolyModel, batch: PolyTrainingBatch) -> Any:
+    """Preserve the legacy call signature when timing fusion is disabled."""
+    if batch.timing_reference is not None:
+        return model(
+            batch.signal,
+            batch.raw_padding_mask,
+            timing_reference=batch.timing_reference,
+        )
+    return model(batch.signal, batch.raw_padding_mask)
 
 
 def _ensure_output_is_safe(

@@ -6,10 +6,10 @@ if [[ $# -eq 0 || "${1:-}" == "--help" ]]; then
   cat <<'HELP'
 Usage: bash scripts/run_length_loss_ablation.sh <manifest.tsv> [config.yaml] [--dry-run]
 Manifest paths are relative to work_root, or absolute inside it.
-Train log_smooth_l1, mae and huber sequentially from fresh initialization on GPU 0.
+Train log_smooth_l1, mae and huber sequentially from fresh initialization on GPU_ID.
 Use the same head, manifest, seeds, batch order and all other training settings.
 Select each best checkpoint by validation nt MAE, then test, plot and compare.
-Defaults: EPOCHS=20 BATCH_SIZE=32 SEED=20260923 LEARNING_RATE=0.001
+Defaults: EPOCHS=20 BATCH_SIZE=8 SEED=20260923 LEARNING_RATE=0.001 GPU_ID=0
           LENGTH_HEAD_MODE=mean_duration HUBER_DELTA_NT=10 SUBSET_PER_GROUP=0
 Optional environment: the defaults above and EXPERIMENT_ID.
 SUBSET_PER_GROUP=200 optionally selects one shared, split-preserving small manifest.
@@ -46,6 +46,7 @@ LEARNING_RATE="${LEARNING_RATE:-0.001}"
 LENGTH_HEAD_MODE="${LENGTH_HEAD_MODE:-mean_duration}"
 HUBER_DELTA_NT="${HUBER_DELTA_NT:-10}"
 SUBSET_PER_GROUP="${SUBSET_PER_GROUP:-0}"
+GPU_ID="${GPU_ID:-0}"
 if [[ ! "$EXPERIMENT_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
   echo "EXPERIMENT_ID must be a single directory name." >&2
   exit 2
@@ -56,13 +57,13 @@ for number in "$EPOCHS" "$BATCH_SIZE"; do
     exit 2
   fi
 done
-for number in "$SEED" "$SUBSET_PER_GROUP"; do
+for number in "$SEED" "$SUBSET_PER_GROUP" "$GPU_ID"; do
   if [[ ! "$number" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    echo "SEED and SUBSET_PER_GROUP must be non-negative integers." >&2
+    echo "SEED, SUBSET_PER_GROUP and GPU_ID must be non-negative integers." >&2
     exit 2
   fi
 done
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES="$GPU_ID"
 export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
@@ -78,7 +79,7 @@ done
 # Pure metadata preflight, including optional subset feasibility, before any writes.
 WORK_ROOT="$("$PARENT_PYTHON" - "$CONFIG" "$MANIFEST" "$EXPERIMENT_ID" \
   "$EPOCHS" "$BATCH_SIZE" "$SEED" "$LEARNING_RATE" "$LENGTH_HEAD_MODE" \
-  "$HUBER_DELTA_NT" "$SUBSET_PER_GROUP" <<'PY'
+  "$HUBER_DELTA_NT" "$SUBSET_PER_GROUP" "$GPU_ID" <<'PY'
 import csv
 import math
 import sys
@@ -96,6 +97,7 @@ learning_rate = float(sys.argv[7])
 head = validate_length_head_mode(sys.argv[8])
 delta = float(sys.argv[9])
 per_group = int(sys.argv[10])
+gpu_id = int(sys.argv[11])
 if not math.isfinite(learning_rate) or learning_rate <= 0:
     raise ValueError("LEARNING_RATE must be a finite positive number")
 c = load_config(Path(config_path))
@@ -157,7 +159,7 @@ for category in ("metadata", "logs", "models", "results/training_evaluation", "c
 epoch_samples = sum(int(r["raw_signal_length"]) for r in rows if r["split"] != "test")
 test_samples = sum(int(r["raw_signal_length"]) for r in rows if r["split"] == "test")
 signal_gib = (epoch_samples * epochs * 3 + test_samples * 3) * 4 / 1024**3
-print(f"Experiment: {experiment} | head={head} | GPU 0 | {epochs} epochs/loss", file=sys.stderr)
+print(f"Experiment: {experiment} | head={head} | GPU {gpu_id} | {epochs} epochs/loss", file=sys.stderr)
 print(f"Shared rows: {len(rows)} | splits={dict(splits)} | batch={batch_size} | seed={seed}", file=sys.stderr)
 print(f"lr={learning_rate} | Huber delta={delta} nt | weights="
       f"{[loss_config[k] for k in ('lambda_location', 'lambda_length', 'lambda_status')]}", file=sys.stderr)
@@ -177,7 +179,7 @@ LOG_DIR="$WORK_ROOT/logs/$EXPERIMENT_ID"
 mkdir -p "$LOG_DIR"
 exec > >(tee -a "$LOG_DIR/pipeline.log") 2>&1
 trap 'code=$?; echo "Loss comparison failed (exit $code) near line $LINENO." >&2; exit "$code"' ERR
-echo "Experiment: $EXPERIMENT_ID | head=$LENGTH_HEAD_MODE | GPU 0 | $EPOCHS epochs/loss"
+echo "Experiment: $EXPERIMENT_ID | head=$LENGTH_HEAD_MODE | GPU $GPU_ID | $EPOCHS epochs/loss"
 echo "Each objective starts fresh; checkpoint selection uses validation nt MAE."
 export XDG_CACHE_HOME="$WORK_ROOT/cache/$EXPERIMENT_ID"
 export MPLCONFIGDIR="$XDG_CACHE_HOME/matplotlib"

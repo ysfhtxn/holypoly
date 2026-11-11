@@ -468,6 +468,7 @@ class BonitoV5MultiTaskModel(nn.Module):
         lambda_length: float = 1.0,
         lambda_status: float = 1.0,
         length_head_mode: str = "mean",
+        use_timing_reference: bool = False,
     ) -> None:
         super().__init__()
         self.basecaller = basecaller
@@ -482,7 +483,16 @@ class BonitoV5MultiTaskModel(nn.Module):
         from holypoly.models.length_head_config import validate_length_head_mode
 
         self.length_head_mode = validate_length_head_mode(length_head_mode)
-        if self.length_head_mode == "mean":
+        if use_timing_reference and self.length_head_mode != "sum":
+            raise ValueError("timing reference currently requires sum pooling")
+        self.use_timing_reference = use_timing_reference
+        if use_timing_reference:
+            from holypoly.models.timing_head import TimingReferenceLengthHead
+
+            self.length_head = TimingReferenceLengthHead(
+                input_features, hidden_features, batch_first=True, dropout=dropout
+            )
+        elif self.length_head_mode == "mean":
             self.length_head = PolyLengthHead(
                 input_features,
                 hidden_features,
@@ -513,9 +523,15 @@ class BonitoV5MultiTaskModel(nn.Module):
         self.lambda_status = _validate_loss_weight(lambda_status, "lambda_status")
 
     def forward(
-        self, signal: Tensor, raw_padding_mask: Tensor | None = None
+        self,
+        signal: Tensor,
+        raw_padding_mask: Tensor | None = None,
+        *,
+        timing_reference: Tensor | None = None,
     ) -> BonitoMultiTaskOutput:
         """Return original CRF scores plus auxiliary predictions."""
+        if timing_reference is not None and not self.use_timing_reference:
+            raise ValueError("model does not enable timing reference")
         checked_signal, raw_lengths = _prepare_signal(signal, raw_padding_mask)
         encoder = _require_v5_encoder(self.basecaller)
         features = encoder.conv(checked_signal)
@@ -528,7 +544,14 @@ class BonitoV5MultiTaskModel(nn.Module):
         )
         basecall_scores = encoder.crf(features)
         location = self.location_head(features, feature_mask)
-        if self.length_head_mode in ("mean", "sum"):
+        if self.use_timing_reference:
+            length = self.length_head(
+                features,
+                feature_mask,
+                raw_lengths_samples=raw_lengths,
+                timing_reference=timing_reference,
+            )
+        elif self.length_head_mode in ("mean", "sum"):
             length = self.length_head(features, feature_mask)
         else:
             length = self.length_head(

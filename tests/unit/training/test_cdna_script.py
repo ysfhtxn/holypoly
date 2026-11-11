@@ -9,6 +9,61 @@ from pathlib import Path
 import pytest
 
 
+def test_invalid_timing_flag_fails_before_basecalling() -> None:
+    """An invalid optional mode must abort before data or GPU work."""
+    script = Path(__file__).resolve().parents[3] / "scripts/holypoly_predict_cdna.sh"
+    result = subprocess.run(
+        ["bash", str(script), "unused"],
+        env={**os.environ, "CHECKPOINT": "unused.pt", "USE_TIMING_REFERENCE": "yes"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "USE_TIMING_REFERENCE must be 0 or 1" in result.stderr
+
+
+@pytest.mark.parametrize("cache_size", ["-1", "1.5", "invalid"])
+def test_reader_cache_size_rejected_before_reading_inputs(cache_size: str) -> None:
+    """Invalid reader cache settings fail before data/model preflight."""
+    project = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        ["bash", str(project / "scripts/holypoly_predict_cdna.sh"), "unused"],
+        env={
+            **os.environ,
+            "CHECKPOINT": "unused.pt",
+            "POD5_READER_CACHE_SIZE": cache_size,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "POD5_READER_CACHE_SIZE" in result.stderr
+
+
+@pytest.mark.parametrize("batch_size", ["0", "-1", "1.5", "invalid"])
+def test_inference_batch_size_rejected_before_reading_inputs(batch_size: str) -> None:
+    """Invalid Poly batch settings must fail before data/model preflight."""
+    project = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        ["bash", str(project / "scripts/holypoly_predict_cdna.sh"), "unused"],
+        env={
+            **os.environ,
+            "CHECKPOINT": "unused.pt",
+            "GPU_ID": "0",
+            "BATCH_SIZE": "8",
+            "MAX_READS": "1",
+            "INFERENCE_BATCH_SIZE": batch_size,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "INFERENCE_BATCH_SIZE" in result.stderr
+
+
 def test_script_environment_loads_real_bonito_cli_without_gpu(tmp_path: Path) -> None:
     """Catch outer-src namespace shadowing using the script's actual path export."""
     project = Path(__file__).resolve().parents[3]
@@ -51,9 +106,9 @@ def test_script_environment_loads_real_bonito_cli_without_gpu(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("dataset", "experiment", "expected"),
     [
-        ("fixed-len", "", "holypoly-predict-fixed-len-cdna"),
-        ("hek293t", "", "holypoly-predict-hek293t-cdna"),
-        ("", "", "holypoly-predict-cdna"),
+        ("fixed-len", "", "holypoly-fixed-len-cdna"),
+        ("hek293t", "", "holypoly-hek293t-cdna"),
+        ("", "", "holypoly-cdna"),
         ("hek293t", "custom-experiment", "custom-experiment"),
         ("../escape", "", None),
         ("two words", "", None),

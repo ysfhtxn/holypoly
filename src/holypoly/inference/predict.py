@@ -25,6 +25,10 @@ from tqdm import tqdm
 
 from holypoly.core.config import load_config
 from holypoly.inference.candidates import candidate_signal_bounds, terminal_candidates
+from holypoly.inference.timing_reference import (
+    timing_reference_from_record,
+    timing_vector,
+)
 from holypoly.models.model import (
     HolypolyModel,
     head_config_from_checkpoint,
@@ -67,6 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-size-samples", type=int, default=12000)
     parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help="Candidate reads per model forward; independent of basecalling batch size",
+    )
+    parser.add_argument(
+        "--pod5-reader-cache-size",
+        type=int,
+        default=8,
+        help="Maximum open POD5 readers reused during prediction; 0 disables caching",
+    )
+    parser.add_argument(
         "--poly-types", nargs="+", choices=("polyA", "polyT"), default=["polyA"]
     )
     parser.add_argument("--min-target-bases", type=int, default=10)
@@ -74,6 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-target-fraction", type=float, default=0.8)
     parser.add_argument("--end-margin-bases", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--use-timing-reference",
+        action="store_true",
+        help="Ordinary-window extraction for a timing-enabled checkpoint (default off)",
+    )
     return parser
 
 
@@ -114,6 +135,9 @@ def candidate_rows(bam_path: Path, args: argparse.Namespace) -> list[dict[str, A
                 "model_zero_nt_probability": "",
             }
             rows.append(row)
+            if getattr(args, "use_timing_reference", False):
+                timing, _ = timing_reference_from_record(record)
+                row.update(timing)
             sequence = record.get_forward_sequence() or ""
             candidates = terminal_candidates(
                 sequence,
@@ -214,14 +238,68 @@ def predict_candidates(
     *,
     device: torch.device,
     chunk_size_samples: int,
+    inference_batch_size: int = 1,
+    use_timing_reference: bool = False,
 ) -> None:
-    """Infer unlabeled candidates one at a time, retaining all input failures.
+    """Infer bounded candidate batches, retaining row order and input failures.
 
-    Signal is normalized float32 [1,1,S]; padding mask is bool [1,S]. No
+    Signal is normalized float32 [B,1,S]; padding mask is bool [B,S]. No
     PolyTrainingRecord, fake labels, or untrained location output is used.
     Model/inference errors propagate instead of being mislabeled input failures.
     """
+    if inference_batch_size < 1:
+        raise ValueError("inference-batch-size must be positive")
     model.eval()
+    batch_rows: list[dict[str, Any]] = []
+    batch_signals: list[torch.Tensor] = []
+    batch_lengths: list[int] = []
+
+    def flush_batch() -> None:
+        """Forward valid signals and assign each result to its original read."""
+        if not batch_rows:
+            return
+        signal_batch = torch.stack(batch_signals)[:, None].to(device)
+        lengths = torch.tensor(batch_lengths, device=device)
+        mask = torch.arange(chunk_size_samples, device=device)[None] >= lengths[:, None]
+        extra = (
+            {
+                "timing_reference": torch.tensor(
+                    [timing_vector(row) for row in batch_rows],
+                    dtype=torch.float32,
+                    device=device,
+                )
+            }
+            if use_timing_reference
+            else {}
+        )
+        output = model(signal_batch, mask, **extra)
+        values = output.length.length_nt.detach().cpu().tolist()
+        logits = (output.location.status_logits + output.length.status_logits) / 2
+        batch_probabilities = logits.softmax(-1).detach().cpu()
+        for row, value, probabilities in zip(
+            batch_rows, values, batch_probabilities, strict=True
+        ):
+            if not math.isfinite(value) or not torch.isfinite(probabilities).all():
+                row.update(
+                    status="prediction_failure", failure_reason="nonfinite_model_output"
+                )
+                continue
+            status = int(probabilities.argmax())
+            row.update(
+                predicted_length_nt=value,
+                status="candidate_predicted",
+                failure_reason="",
+                model_status=ReadStatus(status).name.lower(),
+                model_status_confidence=float(probabilities[status]),
+                model_poly_present_probability=float(
+                    probabilities[int(ReadStatus.POLY_PRESENT)]
+                ),
+                model_zero_nt_probability=float(probabilities[int(ReadStatus.ZERO_NT)]),
+            )
+        batch_rows.clear()
+        batch_signals.clear()
+        batch_lengths.clear()
+
     with torch.inference_mode():
         for row in tqdm(rows, desc="cDNA candidates", unit="read"):
             if row["status"] != "pending":
@@ -243,28 +321,12 @@ def predict_candidates(
             padded = torch.nn.functional.pad(
                 signal.float(), (0, chunk_size_samples - length)
             )
-            mask = torch.arange(chunk_size_samples, device=device)[None] >= length
-            output = model(padded[None, None].to(device), mask)
-            value = float(output.length.length_nt[0])
-            logits = (output.location.status_logits + output.length.status_logits) / 2
-            probabilities = logits.softmax(-1)[0]
-            if not math.isfinite(value) or not torch.isfinite(probabilities).all():
-                row.update(
-                    status="prediction_failure", failure_reason="nonfinite_model_output"
-                )
-                continue
-            status = int(probabilities.argmax())
-            row.update(
-                predicted_length_nt=value,
-                status="candidate_predicted",
-                failure_reason="",
-                model_status=ReadStatus(status).name.lower(),
-                model_status_confidence=float(probabilities[status]),
-                model_poly_present_probability=float(
-                    probabilities[int(ReadStatus.POLY_PRESENT)]
-                ),
-                model_zero_nt_probability=float(probabilities[int(ReadStatus.ZERO_NT)]),
-            )
+            batch_rows.append(row)
+            batch_signals.append(padded)
+            batch_lengths.append(length)
+            if len(batch_rows) == inference_batch_size:
+                flush_batch()
+        flush_batch()
 
 
 def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -296,10 +358,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     """Validate paths, report scope, and predict without touching training outputs."""
     if (
         args.max_reads < 0
+        or args.inference_batch_size < 1
+        or args.pod5_reader_cache_size < 0
         or args.chunk_size_samples < 12
         or args.chunk_size_samples % 12
     ):
-        raise ValueError("invalid max-reads or model input alignment")
+        raise ValueError(
+            "invalid max-reads, inference-batch-size, pod5-reader-cache-size "
+            "or model input alignment"
+        )
     terminal_candidates(
         "",
         min_target_bases=args.min_target_bases,
@@ -401,22 +468,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if expected_size is not None and expected_size != args.chunk_size_samples:
             raise ValueError("chunk-size-samples differs from checkpoint")
         set_random_seed(int(payload["random_seed"]))
+        if (
+            bool(
+                head_config_from_checkpoint(payload).get("use_timing_reference", False)
+            )
+            != args.use_timing_reference
+        ):
+            raise ValueError(
+                "timing-reference option must match checkpoint architecture; "
+                "use --use-timing-reference for a trained timing-enabled checkpoint"
+            )
         model = HolypolyModel(
             load_bonito_v5_model(model_dir, device=str(device)),
             **head_config_from_checkpoint(payload),
         ).to(device)
         model.load_state_dict(payload["model_state_dict"], strict=True)
         standard = model_config["standardisation"]
-        reader = Pod5SignalReader(
-            signal_shift=float(standard["mean"]), signal_scale=float(standard["stdev"])
-        )
-        predict_candidates(
-            model,
-            rows,
-            reader,
-            device=device,
-            chunk_size_samples=args.chunk_size_samples,
-        )
+        with Pod5SignalReader(
+            signal_shift=float(standard["mean"]),
+            signal_scale=float(standard["stdev"]),
+            max_open_files=args.pod5_reader_cache_size,
+        ) as reader:
+            predict_candidates(
+                model,
+                rows,
+                reader,
+                device=device,
+                chunk_size_samples=args.chunk_size_samples,
+                inference_batch_size=args.inference_batch_size,
+                use_timing_reference=args.use_timing_reference,
+            )
         summary.update(
             epoch=int(payload["epoch"]),
             head_config=head_config_from_checkpoint(payload),
@@ -446,6 +527,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             completed.stdout.strip() if completed.returncode == 0 else "unknown"
         )
     summary.update(summarize(rows), finished_utc=datetime.now(UTC).isoformat())
+    if args.use_timing_reference:
+        summary["timing_reference"] = {
+            "available_reads": sum(row["reference_available"] == 1 for row in rows),
+            "status_counts": dict(
+                Counter(str(row["reference_status"]) for row in rows)
+            ),
+        }
     output.mkdir(parents=True, exist_ok=False)
     with (output / "predictions.tsv").open("x", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]), delimiter="\t")

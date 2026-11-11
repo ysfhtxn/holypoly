@@ -47,13 +47,30 @@ CHECKPOINT="models/<joint-run>/heads.epoch_0005.pt" \
 bash scripts/holypoly_predict_cdna.sh "$CDNA_POD5_DIR"
 ```
 
+长度推理支持独立的 `INFERENCE_BATCH_SIZE`，默认 1。例如在上述命令中设置
+`MAX_READS=50000 INFERENCE_BATCH_SIZE=8`，即可处理前 50000 条 primary read，
+每次前向最多 8 条有效候选。`BATCH_SIZE` 只控制 basecalling；复用 BAM 时不起作用。
+直接 Python 入口对应 `--inference-batch-size 8`，并将参数记录到 summary。
+信号仍逐条读取，补齐到原 chunk 长度后批量推理；最后不足一批的候选也会处理。
+失败状态、read 顺序和输出字段保持不变，不改变网络或权重。显存占用随 batch
+增加；实际 GPU 数值一致性和加速幅度需小规模实测。该修改不包含中途保存或恢复。
+
+预测默认通过 `POD5_READER_CACHE_SIZE=8` 复用最多 8 个已打开的 POD5 文件，
+按最近使用顺序淘汰并关闭旧文件，结束或异常退出时释放缓存句柄。
+这减少了同一文件中多条 read 反复打开文件及初始化读取器的开销；不缓存完整信号，
+不改变归一化、候选坐标、read 顺序或模型计算。直接 Python 参数为
+`--pod5-reader-cache-size 8`，也会记录到 summary。设为 0 可恢复逐条打开的行为。
+该缓存只在预测进程启用，训练读取默认保持原行为；它不提供并行预取，
+实际提速取决于文件访问顺序、存储速度及 GPU 计算占比，需对相同小样本实测。
+新设置只对新启动的进程生效，已运行的任务不会自动切换。
+
 相对 POD5 路径相对于 data root；相对 BAM、checkpoint 和 model 路径相对于
 work root。使用 `DATASET_NAME=hek293t` 时，输出位于新建的
-`results/cdna_prediction/holypoly-predict-hek293t-cdna-<time>-<pid>/`。
+`results/cdna_prediction/holypoly-hek293t-cdna-<time>-<pid>/`。
 定长数据可设置 `DATASET_NAME=fixed-len`，得到
-`holypoly-predict-fixed-len-cdna-<time>-<pid>/`。名称只允许字母、数字、点、
+`holypoly-fixed-len-cdna-<time>-<pid>/`。名称只允许字母、数字、点、
 下划线和连字符，且以字母或数字开头；未设置时保留
-`holypoly-predict-cdna-<time>-<pid>/`。`EXPERIMENT_ID` 可覆盖完整任务名。
+`holypoly-cdna-<time>-<pid>/`。`EXPERIMENT_ID` 可覆盖完整任务名。
 输出保留日志、
 `prediction/predictions.tsv`、`prediction/summary.json` 及
 `plots/length_distribution.png/.svg/.pdf`。不改写 POD5 或输入 BAM。
@@ -89,7 +106,7 @@ bash scripts/holypoly_predict_cdna.sh "pod5/<sample>"
 筛选后限制数量。`READ_IDS` 与 `BASECALL_BAM` 不可同时使用，避免复用包含
 train/validation 的 BAM。`RESULT_CATEGORY` 只接受 `training_evaluation` 或
 `cdna_prediction`，默认仍为后者。目录名为
-`results/training_evaluation/holypoly-predict-fixed-len-test-cdna-<time>-<pid>/`。
+`results/training_evaluation/holypoly-fixed-len-test-cdna-<time>-<pid>/`。
 
 原 35000 条 polyA manifest 的 test 有 3500 条，需要读取约 21 MB manifest、
 POD5 UUID 元数据及所选 3500 条 read 的完整信号，不对全部 read basecall。
@@ -132,3 +149,9 @@ polyA-only checkpoint。显式设置 `POLY_TYPES="polyA polyT"` 可以尝试两�
 分母是选中的 primary BAM read，不是全部 POD5 read：没有进入 BAM 的
 basecall 失败 read 不在统计中。不得将候选检出率解释为生物学 PolyA 存在率，
 也不输出 MAE、准确率或泛化能力结论。
+
+## 可选时长参照
+
+默认关闭。已训练的 timing 模型可用 `USE_TIMING_REFERENCE=1` 预测，
+参照在现有 BAM 读取过程中提取；无需已知 head。
+旧 checkpoint 不可仅靠开关启用，见[通用窗口时长参照](timing_reference.md)。

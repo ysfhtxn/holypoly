@@ -56,6 +56,28 @@ Status 在脚本和 CLI 中均默认开启；可显式设置
 `STATUS_SUPERVISION=0`，旧 checkpoint 和结果不被改写。
 length/status 权重未显式指定时取配置文件，启用状态后 location 权重记为 0。
 
+联合入口默认启用训练数据读取优化：`--pod5-reader-cache-size 8` 和
+`--prefetch-batches 2`。长度与序列数据流各自复用最多 8 个 POD5 Reader，
+避免并发使用同一文件句柄；每个数据流用一个 CPU 后台线程按原顺序预取。
+每个队列最多存 2 个 batch，另有正在准备和正在消费的 batch；不全量缓存信号，
+不创建 DataLoader 多进程，GPU forward/backward 始终在主线程执行。
+训练、validation、baseline 和选中 checkpoint 的序列 test 均使用此设置。
+退出或异常时，先等待预取线程结束当前读取，再关闭缓存句柄。
+
+脚本参数对应 `POD5_READER_CACHE_SIZE=8 PREFETCH_BATCHES=2`。
+直接续训可保留原命令，也可显式追加以下参数调整读取开销：
+
+```bash
+--pod5-reader-cache-size 8 --prefetch-batches 2
+```
+
+两者都设置为 0 可恢复逐条打开和同步读取。它们记录在汇总和每轮 checkpoint 的
+`input_pipeline` 中，与模型/loss 的 `joint_config` 分开，不阻止旧 checkpoint
+续训。优化保持归一化、训练目标、被消费样本顺序和每次更新配一批 head 的规则；
+不会自动改变 batch size、学习率或 loss 权重。实际提速取决于磁盘、CPU 与 GPU
+占比，需对相同 batch size 实测。只对新进程生效；运行中的任务保持原行为。
+若中途停止，仍只能从最后完整保存的 epoch 恢复，不保存预取队列或轮内进度。
+
 ## 制作序列 manifest
 
 在项目根目录运行。以下路径是示例：`metadata/experiment/manifest.tsv` 换成已有
@@ -94,11 +116,13 @@ bash scripts/run_reference_joint.sh \
   metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
 ```
 
-去掉 `--dry-run` 开始训练；默认物理 GPU 0，内部为 `cuda:0`。可用环境变量覆盖：
+去掉 `--dry-run` 开始训练；默认物理 GPU 0，内部为 `cuda:0`。
+训练 batch 默认 32，`EVAL_BATCH_SIZE` 可单独控制末尾 test 推理；不设置时继承
+显式的 `BATCH_SIZE`，两者均未设置时 test batch=4，保持已有行为。
+可用环境变量覆盖：
 
 ```bash
 GPU_ID=0 EPOCHS=5 LAMBDA_BASECALL=0.1 ENCODER_LEARNING_RATE=0.00001 \
-INITIALIZE_FROM=models/frozen-sum-huber/heads.epoch_0008.pt \
 bash scripts/run_reference_joint.sh \
   metadata/experiment/manifest.tsv \
   metadata/experiment-reference-head/sequence_manifest.tsv
@@ -109,7 +133,6 @@ bash scripts/run_reference_joint.sh \
 ```bash
 STATUS_SUPERVISION=1 LAMBDA_LENGTH=1 LAMBDA_STATUS=1 LAMBDA_BASECALL=0.1 \
 GPU_ID=0 EPOCHS=5 \
-INITIALIZE_FROM=models/frozen-sum-huber/heads.epoch_0008.pt \
 bash scripts/run_reference_joint.sh \
   metadata/experiment/manifest.tsv \
   metadata/experiment-reference-head/sequence_manifest.tsv
@@ -132,7 +155,7 @@ validation/test 遍历各自全部 accepted head，序列逐条 forward，避免
 进入 CRF loss。完整实验会反复读取所选 POD5 read，预计耗时可能为小时级；
 部分 encoder backward 比冻结训练占用更多显存，应先用小 manifest。
 
-脚本会创建新的 `models/<run>`、`logs/<run>`、`results/training_evaluation/<run>` 和 pipeline 日志：
+新实验会创建新的 `models/<run>`、`logs/<run>`、`results/training_evaluation/<run>` 和 pipeline 日志：
 
 - 训练前保存 head validation 的原始 CRF loss/解码编辑率作为 baseline。
 - 每轮保留完整 checkpoint；按 validation 长度偏差最小选择最佳轮次。
@@ -153,7 +176,37 @@ length status 分支，不等同于共享状态解码，不应混作联合状态
 完整 checkpoint 预计每份约 0.4 GiB，5 轮含 latest 约 2.4 GiB，另留临时文件空间。
 实际大小以运行结果为准。新目录已存在时拒绝覆盖。
 
-续训使用独立入口，`--epochs` 是目标总轮数；保持所有其余设置相同：
+脚本支持续训并在结束后自动完成最佳模型的长度测试和绘图。设置 `RESUME=1`
+或追加 `--resume`，同时必须显式指定原 `EXPERIMENT_ID`。`EPOCHS` 是目标总轮数，
+必须大于最后保存的 epoch；除长度 batch size 和读取优化参数外，保持原训练设置：
+
+```bash
+RESUME=1 EXPERIMENT_ID=<existing-joint-run> \
+GPU_ID=0 EPOCHS=10 BATCH_SIZE=32 \
+STATUS_SUPERVISION=1 LAMBDA_LENGTH=1 LAMBDA_STATUS=1 LAMBDA_BASECALL=0.1 \
+bash scripts/run_reference_joint.sh \
+  metadata/experiment/manifest.tsv \
+  metadata/experiment-reference-head/sequence_manifest.tsv
+```
+
+续训不能同时指定 `INITIALIZE_FROM`；恢复原模型、optimizer、epoch 和 global step，
+追加原 `train.jsonl`，继续保存每轮快照并更新 latest checkpoint 和运行汇总。
+沿用完整历史 validation 选择最佳模型，最佳轮次不一定是最新一轮。
+旧测试和图表不覆盖，新输出放在：
+
+```text
+results/training_evaluation/<run>/resume-<时间>-<PID>/
+├── test-best-validation/       # 新长度测试结果及 plots/
+└── training-plots/            # 含全部历史 epoch 的曲线
+logs/<run>-pipeline-resume-<时间>-<PID>/pipeline.log
+```
+
+续训也支持 `--dry-run`（可与 `--resume` 任意排序），只执行恢复检查，
+不创建新的 pipeline、测试或图表目录。训练或测试失败时停止，不继续后续步骤。
+已经训练结束且只需补测/补图时，不要通过增加 epoch 来触发此流程，
+应单独运行 `holypoly.training.evaluate` 和 `scripts/plot_training.py`。
+
+只需要续训、不需要后续长度测试和绘图时，可使用独立入口：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src src/bonito/.venv/bin/python \
@@ -169,6 +222,31 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src src/bonito/.venv/bin/python \
 需要人工核对二者再恢复，程序不会自动删除冲突记录。原 epoch 的 head test 文件保留。
 三项 loss 实验续训保持 status 开启和原有权重参数；不能把旧两项 loss
 实验直接按三项 loss resume。旧两项续训显式加 `--no-supervise-status`。
+
+续训默认允许改变长度训练的 batch size，直接设置新值即可：
+
+```bash
+--resume --epochs 8 --batch-size 64
+```
+
+默认只允许改变 `--batch-size`，不能改变
+`--sequence-batch-size`、学习率、loss、解冻层数、随机种子或输入数据。
+可用 `--no-allow-batch-size-change` 要求 batch size 也严格匹配。
+保留 `--allow-batch-size-change` 作为兼容写法，无需显式添加；新训练不受此设置影响。
+保留已有 optimizer 动量及 global step，不自动缩放学习率。
+旧 epoch 快照和历史日志保持原样，新 epoch 的 `joint_config` 记录实际 batch size；
+checkpoint 与运行汇总中的 `length_batch_size_changes` 记录变更发生的 epoch、
+global step、原值、新值和时间。
+最佳 checkpoint 的配置以其所属 epoch 为准，可能仍是变更前的旧 epoch。
+
+当前每次长度更新使用一批 head 序列监督。以 28000 条长度训练样本为例，
+batch 从 8 改为 64 后，每轮更新从 3500 次降为 438 次；head batch=1 时，
+每轮序列监督样本数也相应从 3500 降为 438。该选项不自动补齐序列监督量，
+因此它不是原 batch 配置下完全等价的训练，需继续检查验证集长度和序列表现。
+
+续训可先加 `--dry-run`：读取两份 manifest、日志、运行汇总和 checkpoint 的
+CPU mmap 元数据，检查 batch 变更和历史一致性；不加载模型到 GPU、不读 POD5
+信号、不写实验文件。实际恢复时仍会检查 loss、模型结构及 optimizer 状态。
 
 ## 如何判断收益
 
@@ -189,16 +267,7 @@ basecalling 准确率；head 监督也不保证能解决同聚物长度估计或
 关键实现：`datasets/prepare_sequence.py`、`training/sequence_data.py`、
 `models/joint_model.py`、`training/joint_engine.py`、`training/joint_command.py`。
 
-## 本次变更范围
+## 可选时长参照
 
-- 新增上述 5 个模块，以及 `scripts/run_reference_joint.sh`。
-- `training/engine.py`：可选 joint checkpoint 配置及恢复检查。
-- `training/evaluate.py`：评估汇总携带 joint 配置。
-- `scripts/plot_training.py`：新增 CRF/编辑率曲线，按实际 loss 命名。
-- `pyproject.toml`：为新的 Torch Dataset 添加现有模式的 mypy 例外，不新增依赖。
-- 测试：新增 `tests/isolated/datasets/test_prepare_sequence.py` 和
-  `tests/isolated/training/test_reference_joint.py`；扩展
-  `tests/unit/training/test_plot_inputs.py`。
-- 文档：本文件、README、`docs/common_commands.md` 和 `docs/checkpoints.md`。
-
-Bonito 子模块、原始数据和历史实验结果未修改。
+`USE_TIMING_REFERENCE=0` 为默认值；启用时需配套、独立制作的参照表和新实验。
+完整命令及限制见[通用窗口时长参照](timing_reference.md)。

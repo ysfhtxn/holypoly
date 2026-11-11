@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import array
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +173,152 @@ def test_locating_signal_reports_missing_ids_without_reading_samples(
         )
 
 
+@pytest.mark.parametrize("batch_size", [2, 4, 8])
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_batched_inference_matches_single_reads_and_flushes_tail(
+    batch_size: int,
+    with_timing: bool,
+) -> None:
+    """Mixed signal lengths, A/T rows and read failures retain exact associations."""
+    torch.manual_seed(23)
+    model = HolypolyModel(
+        tiny_v5_basecaller(),
+        hidden_features=16,
+        length_head_mode="sum",
+        use_timing_reference=with_timing,
+    )
+    if with_timing:
+        with torch.no_grad():
+            model.length_head.timing_residual[-1].bias.fill_(3)
+    rows = [
+        {
+            "read_id": f"synthetic-{i}",
+            "status": "pending",
+            "pod5_path": "unused",
+            "raw_signal_length": 120,
+            "start_sample": 12,
+            "end_sample": end,
+            "predicted_length_nt": "",
+            "poly_type": "polyA" if i % 2 else "polyT",
+            "reference_available": int(i % 2 == 0),
+            "reference_status": "ok" if i % 2 == 0 else "sequence_too_short",
+            "reference_samples_per_base": 12 if i % 2 == 0 else "",
+            "reference_log_rate_sd": 0.1 if i % 2 == 0 else "",
+        }
+        for i, end in enumerate((36, 48, 72, 96, 120))
+    ]
+    rows.insert(1, {**rows[0], "read_id": "missing"})
+    rows.insert(3, {**rows[0], "read_id": "no-candidate", "status": "no_candidate"})
+
+    def reader(path: Path, read_id: str) -> torch.Tensor:
+        if read_id == "missing":
+            raise KeyError("synthetic missing signal")
+        assert read_id != "no-candidate"
+        index = int(read_id.split("-")[-1])
+        return torch.linspace(-1, 1, 120) + index * 0.2
+
+    single, batched = deepcopy(rows), deepcopy(rows)
+    predict_candidates(
+        model,
+        single,
+        reader,
+        device=torch.device("cpu"),
+        chunk_size_samples=120,
+        use_timing_reference=with_timing,
+    )
+    observed = []
+
+    def capture(module: Any, inputs: Any) -> None:
+        signal, mask = inputs
+        assert signal.shape == (len(mask), 1, 120)
+        assert mask.dtype == torch.bool
+        assert not signal.requires_grad
+        observed.extend((~mask).sum(dim=1).tolist())
+
+    hook = model.register_forward_pre_hook(capture)
+    predict_candidates(
+        model,
+        batched,
+        reader,
+        device=torch.device("cpu"),
+        chunk_size_samples=120,
+        inference_batch_size=batch_size,
+        use_timing_reference=with_timing,
+    )
+    hook.remove()
+    assert observed == [24, 36, 60, 84, 108]
+    assert [r["read_id"] for r in batched] == [r["read_id"] for r in rows]
+    for expected, actual in zip(single, batched, strict=True):
+        assert actual["status"] == expected["status"]
+        if actual["status"] == "candidate_predicted":
+            for key in (
+                "predicted_length_nt",
+                "model_status_confidence",
+                "model_poly_present_probability",
+                "model_zero_nt_probability",
+            ):
+                assert actual[key] == pytest.approx(expected[key], rel=1e-5, abs=1e-6)
+            assert actual["model_status"] == expected["model_status"]
+        else:
+            assert actual["predicted_length_nt"] == ""
+    assert all(p.grad is None for p in model.parameters())
+
+
+def test_batch_nonfinite_output_only_marks_its_read_and_forward_errors_propagate():
+    """A bad output cannot invalidate its batch peers or silently become zero nt."""
+    model = HolypolyModel(tiny_v5_basecaller(), hidden_features=16)
+    rows = [
+        {
+            "read_id": f"synthetic-{i}",
+            "status": "pending",
+            "pod5_path": "unused",
+            "raw_signal_length": 120,
+            "start_sample": 0,
+            "end_sample": 72,
+            "predicted_length_nt": "",
+        }
+        for i in range(3)
+    ]
+
+    def corrupt_one(module: Any, inputs: Any, output: Any) -> Any:
+        lengths = output.length.length_nt.clone()
+        lengths[1] = float("nan")
+        return replace(output, length=replace(output.length, length_nt=lengths))
+
+    hook = model.register_forward_hook(corrupt_one)
+    predict_candidates(
+        model,
+        rows,
+        lambda p, i: torch.ones(120),
+        device=torch.device("cpu"),
+        chunk_size_samples=120,
+        inference_batch_size=3,
+    )
+    hook.remove()
+    assert [r["status"] for r in rows] == [
+        "candidate_predicted",
+        "prediction_failure",
+        "candidate_predicted",
+    ]
+    assert rows[1]["predicted_length_nt"] == ""
+
+    def fail_forward(module: Any, inputs: Any) -> None:
+        raise RuntimeError("synthetic forward failure")
+
+    rows[0]["status"] = "pending"
+    hook = model.register_forward_pre_hook(fail_forward)
+    with pytest.raises(RuntimeError, match="synthetic forward failure"):
+        predict_candidates(
+            model,
+            rows,
+            lambda p, i: torch.ones(120),
+            device=torch.device("cpu"),
+            chunk_size_samples=120,
+            inference_batch_size=3,
+        )
+    hook.remove()
+
+
 def test_dry_run_does_not_load_bam_signals_weights_or_create_output(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -213,7 +361,19 @@ def test_dry_run_does_not_load_bam_signals_weights_or_create_output(
     monkeypatch.setattr(torch, "load", forbidden)
     summary = run(args)
     assert summary["pod5_files"] == 1
+    assert summary["arguments"]["inference_batch_size"] == 1
+    assert summary["arguments"]["pod5_reader_cache_size"] == 8
     assert not (work / "out").exists()
+    args.inference_batch_size = 0
+    with pytest.raises(ValueError, match="inference-batch-size"):
+        run(args)
+    args.inference_batch_size = 8
+    assert run(args)["arguments"]["inference_batch_size"] == 8
+    args.pod5_reader_cache_size = -1
+    with pytest.raises(ValueError, match="pod5-reader-cache-size"):
+        run(args)
+    args.pod5_reader_cache_size = 0
+    assert run(args)["arguments"]["pod5_reader_cache_size"] == 0
     args.output_dir = data / "unsafe"
     with pytest.raises(ValueError, match="output must"):
         run(args)

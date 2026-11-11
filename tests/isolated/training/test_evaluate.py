@@ -55,6 +55,58 @@ def _record(read_id: str) -> PolyTrainingRecord:
     )
 
 
+def test_timing_evaluation_maps_references_and_retains_failures() -> None:
+    """Available and unavailable reads share batches without mixing references."""
+    records = [_record(name) for name in ("a", "t", "unreadable")]
+
+    def reader(path: Path, read_id: str) -> torch.Tensor:
+        if read_id == "unreadable":
+            raise KeyError("synthetic missing signal")
+        return torch.linspace(-2, 2, 240)
+
+    model = HolypolyModel(
+        tiny_v5_basecaller(),
+        hidden_features=6,
+        length_head_mode="sum",
+        use_timing_reference=True,
+    ).eval()
+    with torch.no_grad():
+        model.length_head.timing_residual[-1].bias.fill_(3)
+    dataset = PolyTrainingDataset(records, reader)
+    references = {
+        "a": (math.log1p(12), 0.1, 1),
+        "t": (0, 0, 0),
+        "unreadable": (0, 0, 0),
+    }
+    plain = predict_reads(model, dataset, device=torch.device("cpu"), batch_size=2)
+    timed = predict_reads(
+        model,
+        dataset,
+        device=torch.device("cpu"),
+        batch_size=2,
+        timing_references=references,
+    )
+    single = predict_reads(
+        model,
+        dataset,
+        device=torch.device("cpu"),
+        batch_size=1,
+        timing_references=references,
+    )
+    assert [row["read_id"] for row in timed] == [row.read_id for row in records]
+    assert timed[0]["regression_length_nt"] > plain[0]["regression_length_nt"]
+    assert timed[1]["regression_length_nt"] == plain[1]["regression_length_nt"]
+    assert timed[2] == plain[2] == single[2]
+    assert timed[2]["prediction_status"] == "input_failure"
+    for row, expected in zip(timed[:2], single[:2], strict=True):
+        assert row["regression_length_nt"] == pytest.approx(
+            expected["regression_length_nt"]
+        )
+        assert row["shared_poly_present_probability"] == pytest.approx(
+            plain[timed.index(row)]["shared_poly_present_probability"]
+        )
+
+
 @pytest.mark.parametrize("head_free", [False, True])
 def test_predict_preserves_failures_and_never_updates_parameters(
     head_free: bool,

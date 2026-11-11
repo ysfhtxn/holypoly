@@ -14,7 +14,7 @@
 │           ├── metrics_by_group.tsv
 │           └── plots/
 ├── cdna_prediction/
-│   └── holypoly-predict-<dataset>-cdna-<YYYYMMDD-HHMMSS>-<PID>/
+│   └── holypoly-<dataset>-cdna-<YYYYMMDD-HHMMSS>-<PID>/
 │       ├── pipeline.log
 │       ├── basecalls.bam
 │       ├── basecalling.log
@@ -42,9 +42,9 @@ pooling 消融及其结果汇总均使用此目录。状态校准仅使用 valid
 `cdna_prediction`：对输入 POD5 进行实际候选预测和分布统计，由
 `scripts/holypoly_predict_cdna.sh` 创建。通过 `DATASET_NAME=fixed-len` 或
 `DATASET_NAME=hek293t` 设置数据集名，时间和 PID 自动追加，例如
-`holypoly-predict-fixed-len-cdna-20261102-120000-12345`。
+`holypoly-fixed-len-cdna-20261102-120000-12345`。
 数据集名以字母或数字开头，仅含字母、数字、点、下划线和连字符。
-未设置时保留原 `holypoly-predict-cdna-<YYYYMMDD-HHMMSS>-<PID>` 命名。
+未设置时保留原 `holypoly-cdna-<YYYYMMDD-HHMMSS>-<PID>` 命名。
 `EXPERIMENT_ID` 优先级更高，可覆盖完整任务名。
 复用已有 BAM 时不生成 `basecalls.bam` 或 `basecalling.log`。
 “实际预测”只描述用途；迁移到生物样本的效果尚未验证，候选分布不等同于
@@ -62,7 +62,7 @@ pooling 消融及其结果汇总均使用此目录。状态校准仅使用 valid
 默认不移动、重命名或覆盖现有结果；用户明确要求的目录归类迁移应保持内容，
 并核对迁移前后的文件哈希。旧联合训练/状态校准通过原命令显式
 `--resume` 时，优先继续其已有的旧 `results/<run-id>/`；若新旧路径同时存在，
-报错以免混用。`resume_length_head_ablation.sh` 可读取旧或新布局中的源结果，
+报错以免混用。`scripts/legacy/resume_length_head_ablation.sh` 可读取旧或新布局中的源结果，
 续训分叉的新结果写入 `training_evaluation`。
 
 底层 `holypoly.training.evaluate`、`holypoly.inference.predict` 及独立绘图

@@ -6,12 +6,15 @@ if [[ $# -lt 1 || "${1:-}" == "--help" ]]; then
 Usage: CHECKPOINT=models/<run>/heads.epoch_0005.pt bash scripts/holypoly_predict_cdna.sh <pod5-dir> [config.yaml]
 POD5 path is relative to data_root; outputs use work_root/results/cdna_prediction/<experiment>.
 Defaults: GPU_ID=0 MAX_READS=1000 BATCH_SIZE=8 POLY_TYPES=polyA
+          INFERENCE_BATCH_SIZE=1 (Poly prediction; BATCH_SIZE is basecalling only)
+          POD5_READER_CACHE_SIZE=8 (open POD5 handles; 0 disables reuse)
 Optional: MODEL_DIR=<existing Bonito v5 model>, EXPERIMENT_ID, BASECALL_BAM=<existing BAM>
           DATASET_NAME=<dataset>, e.g. fixed-len or hek293t
           READ_IDS=<work-root-relative text file>, one read UUID per line, no header
           RESULT_CATEGORY=cdna_prediction or training_evaluation
           MIN_TARGET_BASES=10 END_MARGIN_BASES=100 CHUNK_SIZE_SAMPLES=12000
-DATASET_NAME adds a dataset name: holypoly-predict-<dataset>-cdna-<time>-<PID>.
+          USE_TIMING_REFERENCE=0 (default); 1 requires a timing-enabled trained checkpoint.
+DATASET_NAME adds a dataset name: holypoly-<dataset>-cdna-<time>-<PID>.
 EXPERIMENT_ID overrides the complete output name; unset DATASET_NAME keeps the old name.
 MAX_READS=0 explicitly processes all reads. BASECALL_BAM must contain mv/ts/ns tags.
 READ_IDS selects reads before basecalling; cannot combine with BASECALL_BAM.
@@ -30,8 +33,19 @@ CONFIG="${2:-configs/local.yaml}"
 GPU_ID="${GPU_ID:-0}"
 MAX_READS="${MAX_READS:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-if [[ ! "$GPU_ID" =~ ^(0|[1-9][0-9]*)$ || ! "$MAX_READS" =~ ^(0|[1-9][0-9]*)$ || ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-  echo 'GPU_ID, MAX_READS and BATCH_SIZE must be valid single-device integer settings' >&2; exit 2
+INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-1}"
+POD5_READER_CACHE_SIZE="${POD5_READER_CACHE_SIZE:-8}"
+TIMING_ARGS=()
+case "${USE_TIMING_REFERENCE:-0}" in
+  0) ;;
+  1) TIMING_ARGS+=(--use-timing-reference) ;;
+  *) echo "USE_TIMING_REFERENCE must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ ! "$POD5_READER_CACHE_SIZE" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo 'POD5_READER_CACHE_SIZE must be a nonnegative integer' >&2; exit 2
+fi
+if [[ ! "$GPU_ID" =~ ^(0|[1-9][0-9]*)$ || ! "$MAX_READS" =~ ^(0|[1-9][0-9]*)$ || ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ || ! "$INFERENCE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+  echo 'GPU_ID, MAX_READS, BATCH_SIZE and INFERENCE_BATCH_SIZE must be valid single-device integer settings' >&2; exit 2
 fi
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 # The submodule root must precede src so Python loads bonito/bonito/__init__.py.
@@ -120,6 +134,8 @@ mkdir "$OUTPUT"
 exec > >(tee "$OUTPUT/pipeline.log") 2>&1
 echo "Dataset: ${DATASET_NAME:-unspecified}; experiment: $EXPERIMENT_ID"
 echo "Selected read limit: $MAX_READS (0=all); physical GPU: $GPU_ID"
+echo "Poly inference batch size: $INFERENCE_BATCH_SIZE"
+echo "POD5 reader cache size: $POD5_READER_CACHE_SIZE (0=disabled)"
 echo 'POD5 UUID metadata is read; no raw data is changed. Output: predictions TSV and distribution plots.'
 if [[ -z "${BASECALL_BAM:-}" ]]; then
   echo 'Bonito basecalls the selected reads; signal volume/runtime depend on read lengths.'
@@ -139,7 +155,9 @@ read -r -a TYPES <<< "${POLY_TYPES:-polyA}"
   --model-dir "$MODEL_PATH" --output-dir "$OUTPUT/prediction" \
   --max-reads "$MAX_READS" --poly-types "${TYPES[@]}" \
   --chunk-size-samples "${CHUNK_SIZE_SAMPLES:-12000}" \
-  --min-target-bases "${MIN_TARGET_BASES:-10}" --end-margin-bases "${END_MARGIN_BASES:-100}"
+  --inference-batch-size "$INFERENCE_BATCH_SIZE" \
+  --pod5-reader-cache-size "$POD5_READER_CACHE_SIZE" \
+  --min-target-bases "${MIN_TARGET_BASES:-10}" --end-margin-bases "${END_MARGIN_BASES:-100}" "${TIMING_ARGS[@]}"
 "$PARENT_PYTHON" scripts/plot_cdna_predictions.py --config "$CONFIG" \
   --predictions "$OUTPUT/prediction/predictions.tsv" --output "$OUTPUT/plots"
 echo "Finished: $OUTPUT"
