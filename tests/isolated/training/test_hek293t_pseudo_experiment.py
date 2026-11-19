@@ -16,7 +16,7 @@ from tests.isolated.training.test_reference_joint import joint_basecaller
 SPEC = importlib.util.spec_from_file_location(
     "pseudo_experiment",
     Path(__file__).resolve().parents[3]
-    / "diagnostics_hek293t_pseudo_label/run_experiment.py",
+    / "diagnostics/hek293t_pseudo_label/run_experiment.py",
 )
 EXPERIMENT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPERIMENT)

@@ -1,6 +1,6 @@
 # 历史脚本
 
-从项目根目录调用本目录脚本。新训练使用 `scripts/run_reference_joint.sh`。
+从项目根目录调用本目录脚本。新训练使用 `scripts/run_joint_training.sh`。
 
 - `resume_length_head_ablation.sh`：仅恢复指定默认五轮 head 对照至二十轮。
 - `plot_head_poly_audit.py`：绘制已完成的 v3→v4 信号范围审计。

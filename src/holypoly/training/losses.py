@@ -10,6 +10,7 @@ from torch import Tensor, nn
 
 from holypoly.models.poly_heads import (
     BonitoMultiTaskOutput,
+    PolyAuxiliaryOutput,
     ReadStatus,
     masked_status_loss,
 )
@@ -45,7 +46,7 @@ class PolyAuxiliaryLoss(nn.Module):
 
     def forward(
         self,
-        output: BonitoMultiTaskOutput,
+        output: BonitoMultiTaskOutput | PolyAuxiliaryOutput,
         location_targets: Tensor,
         training_length_nt: Tensor,
         status_targets: Tensor,

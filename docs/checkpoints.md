@@ -20,9 +20,9 @@ epoch、global step、随机状态、manifest schema、模型/loss 配置和版�
 
 ```bash
 EXPERIMENT_ID=experiment EPOCHS=10 GPU_ID=0 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --resume --dry-run
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv --resume --dry-run
 ```
 
 检查后去掉 `--dry-run`。`EPOCHS` 是目标总轮数，模型、loss 和输入来源必须一致；
@@ -51,9 +51,17 @@ delta 仅在 Huber 模式比较；旧 checkpoint 缺失新字段时按原 log lo
 更换 loss 的实验应使用新输出目录，参见[长度 loss 说明](length_losses.md)。
 
 常规 joint checkpoint 额外记录 `joint_config`（两份 manifest 及参考哈希、encoder
-解冻层数、学习率、CRF 权重等）。恢复必须使用对应的 joint 入口且设置一致；
+解冻层数、学习率、CRF 权重等）。恢复必须使用对应的 joint 入口；默认允许改变长度
+batch size 和 head/encoder 学习率，其他设置须一致。学习率在恢复 optimizer 后应用，
+保留动量，变更记录在 `learning_rate_changes`；可显式关闭变更许可。
 旧冻结入口会拒绝 joint checkpoint。评估可沿用现有 `training.evaluate`。
 见[联合训练说明](reference_joint_training.md)。
+
+从指定历史 joint 快照创建分支，用 `--resume-from
+models/<parent>/heads.epoch_0005.pt --run-id <new-run>`（脚本为 `RESUME_FROM`）。
+这会复制截至第 5 轮的快照和日志，在新目录恢复 optimizer 并训练后续轮次；
+来源记录为 `branch_origin`，源实验和之后轮次保持原样。不能与 `--resume` 或
+`--initialize-from` 同用，dry-run 不复制文件。降低学习率也无需额外许可参数。
 
 ## 选择某轮评估
 
@@ -63,7 +71,7 @@ delta 仅在 Huber 模式比较；旧 checkpoint 缺失新字段时按原 log lo
 CUDA_VISIBLE_DEVICES=<physical-gpu-id> PYTHONPATH=src \
   src/bonito/.venv/bin/python -m holypoly.training.evaluate \
   --config configs/local.yaml \
-  --manifest metadata/experiment/manifest.tsv \
+  --manifest metadata/experiment/length/manifest.tsv \
   --checkpoint models/experiment/heads.epoch_0003.pt \
   --output-dir results/training_evaluation/experiment/validation-epoch3 \
   --split validation --batch-size 32

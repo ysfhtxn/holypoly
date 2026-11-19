@@ -24,7 +24,7 @@
 总 loss 仍为三个分项按 `lambda_location`、`lambda_length`、`lambda_status` 加权求和，
 三个权重保持配置值。不同定义的 loss 数值尺度不同，尤其 Huber 的线性区梯度大小
 为 delta；不能直接通过 total loss 的大小比较实验优劣。
-v4 的定位和状态项仍不受监督。
+head–Poly 数据的定位和状态项仍不受监督。
 
 ## 参数与配置
 
@@ -58,11 +58,11 @@ model:
 ```bash
 # 先验证参数、manifest、输出路径和预计读取量，不写文件。
 bash scripts/run_length_loss_ablation.sh \
-  "metadata/<small-v4-dataset>/manifest.tsv" --dry-run
+  "metadata/<small-dataset>/length/manifest.tsv" --dry-run
 
 # 执行完整对照，所有输出使用新的时间戳实验目录。
 bash scripts/run_length_loss_ablation.sh \
-  "metadata/<small-v4-dataset>/manifest.tsv"
+  "metadata/<small-dataset>/length/manifest.tsv"
 ```
 
 第二个位置参数可指定配置文件。环境变量支持 `EPOCHS`（20）、`BATCH_SIZE`（8）、
@@ -75,7 +75,7 @@ bash scripts/run_length_loss_ablation.sh \
 
 ```bash
 LENGTH_HEAD_MODE=mean HUBER_DELTA_NT=5 \
-  bash scripts/run_length_loss_ablation.sh "metadata/<small-v4-dataset>/manifest.tsv"
+  bash scripts/run_length_loss_ablation.sh "metadata/<small-dataset>/length/manifest.tsv"
 ```
 
 每组产出 `models/<experiment>-<loss>/heads.epoch_*.pt`、日志、
@@ -97,7 +97,7 @@ EXPERIMENT_ID="length-loss-$(date +%Y%m%d-%H%M%S)"
 for loss in log_smooth_l1 mae huber; do
   CUDA_VISIBLE_DEVICES=0 .venv/bin/holypoly train \
     --config configs/local.yaml \
-    --manifest "metadata/<small-v4-dataset>/manifest.tsv" \
+    --manifest "metadata/<small-dataset>/length/manifest.tsv" \
     --length-head-mode mean_duration \
     --length-loss "$loss" --huber-delta-nt 10 \
     --checkpoint "models/${EXPERIMENT_ID}-${loss}/heads.pt" \

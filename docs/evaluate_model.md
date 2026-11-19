@@ -12,9 +12,9 @@ POD5。运行环境是 `src/bonito/.venv`，父项目不需要新增 Torch、POD
 
 ```bash
 GPU_ID=0 EPOCHS=5 BATCH_SIZE=32 EVAL_BATCH_SIZE=4 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv --dry-run
 ```
 
 确认输入和资源后去掉 `--dry-run`。脚本自动按 validation 选轮、测试和绘图。
@@ -26,7 +26,7 @@ bash scripts/run_reference_joint.sh \
 ```bash
 PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.training.evaluate \
   --config configs/local.yaml \
-  --manifest metadata/experiment/manifest.tsv \
+  --manifest metadata/experiment/length/manifest.tsv \
   --checkpoint models/experiment/heads.epoch_0001.pt \
   --output-dir results/training_evaluation/experiment/test-epoch1 \
   --batch-size 32 --dry-run
@@ -42,7 +42,7 @@ PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.training.evaluate \
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
   src/bonito/.venv/bin/python -m holypoly.training.evaluate \
   --config configs/local.yaml \
-  --manifest metadata/experiment/manifest.tsv \
+  --manifest metadata/experiment/length/manifest.tsv \
   --checkpoint models/experiment/heads.epoch_0001.pt \
   --output-dir results/training_evaluation/experiment/test-epoch1 \
   --batch-size 32
@@ -115,6 +115,12 @@ uv run python scripts/plot_training.py \
 仅 polyT 时只显示 polyT，两者都有时分别显示；0 nt 单独标为 `0 nt`。
 不为不存在的长度×类型组合绘制空柱或预留位置；单类型组位于其标称长度中心。
 `plot_summary.json` 记录 `poly_types`、`length_axis=numeric_nt` 和标称长度列表。
+四个面板默认固定纵轴以便跨实验比较：a 为 0–650 reads，b/c 为 0–350 nt，
+d 为 −200–200 nt；c 的标称长度横轴与其他面板一致，不随预测离群点扩展。
+需要更大范围时，所有待比较图必须使用同一组
+`--prediction-ylim 0 500 --error-ylim -300 300 --count-ymax 1000` 等参数。
+范围不足以容纳数据或标称参考值时明确报错，不自动放大或静默裁掉离群点。
+实际纵轴范围写入 `plot_summary.json` 的 `axis_limits`。
 该命令可以重复运行，会更新指定目录中的绘图文件；不会修改原测试结果。
 
 ## 5. 绘制训练日志

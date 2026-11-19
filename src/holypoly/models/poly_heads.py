@@ -10,6 +10,11 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
 
+from holypoly.models.length_head_config import (
+    DEFAULT_TCN_LENGTH_FEATURES,
+    DEFAULT_TCN_LENGTH_SUM_SCALE,
+)
+
 BONITO_V5_STRIDE = 6
 
 
@@ -71,6 +76,16 @@ class BonitoMultiTaskOutput:
     """Unchanged Bonito scores plus auxiliary head outputs."""
 
     basecall_scores: Tensor
+    encoder_features: Tensor
+    feature_padding_mask: Tensor
+    location: PolyLocationOutput
+    length: PolyLengthOutput
+
+
+@dataclass(frozen=True)
+class PolyAuxiliaryOutput:
+    """Poly-only predictions, without allocating unused CRF scores."""
+
     encoder_features: Tensor
     feature_padding_mask: Tensor
     location: PolyLocationOutput
@@ -469,24 +484,52 @@ class BonitoV5MultiTaskModel(nn.Module):
         lambda_status: float = 1.0,
         length_head_mode: str = "mean",
         use_timing_reference: bool = False,
+        head_type: str = "legacy",
+        tcn_length_sum_scale: float = DEFAULT_TCN_LENGTH_SUM_SCALE,
+        tcn_length_features: str = DEFAULT_TCN_LENGTH_FEATURES,
     ) -> None:
         super().__init__()
         self.basecaller = basecaller
         encoder = _require_v5_encoder(basecaller)
         input_features = int(encoder.crf.linear.in_features)
-        self.location_head = PolyLocationHead(
-            input_features,
-            hidden_features,
-            batch_first=True,
-            dropout=dropout,
+        from holypoly.models.length_head_config import (
+            validate_head_type,
+            validate_length_head_mode,
         )
-        from holypoly.models.length_head_config import validate_length_head_mode
+
+        self.head_type = validate_head_type(head_type)
+        if self.head_type == "tcn":
+            if hidden_features != 128 or dropout != 0.0:
+                raise ValueError(
+                    "tcn requires hidden_features=128 and projection dropout=0; "
+                    "TCN block dropout is fixed at 0.1"
+                )
+            if length_head_mode != "sum" or use_timing_reference:
+                raise ValueError("tcn requires sum pooling and no timing reference")
+            from holypoly.models.tcn_heads import TCNLocationHead
+
+            self.location_head = TCNLocationHead(input_features)
+        else:
+            self.location_head = PolyLocationHead(
+                input_features,
+                hidden_features,
+                batch_first=True,
+                dropout=dropout,
+            )
 
         self.length_head_mode = validate_length_head_mode(length_head_mode)
         if use_timing_reference and self.length_head_mode != "sum":
             raise ValueError("timing reference currently requires sum pooling")
         self.use_timing_reference = use_timing_reference
-        if use_timing_reference:
+        if self.head_type == "tcn":
+            from holypoly.models.tcn_heads import TCNLengthHead
+
+            self.length_head = TCNLengthHead(
+                input_features,
+                tcn_length_sum_scale=tcn_length_sum_scale,
+                tcn_length_features=tcn_length_features,
+            )
+        elif use_timing_reference:
             from holypoly.models.timing_head import TimingReferenceLengthHead
 
             self.length_head = TimingReferenceLengthHead(
@@ -543,6 +586,56 @@ class BonitoV5MultiTaskModel(nn.Module):
             stride=BONITO_V5_STRIDE,
         )
         basecall_scores = encoder.crf(features)
+        auxiliary = self._predict_poly(
+            features, feature_mask, raw_lengths, timing_reference
+        )
+        return BonitoMultiTaskOutput(
+            basecall_scores=basecall_scores,
+            encoder_features=features,
+            feature_padding_mask=feature_mask,
+            location=auxiliary.location,
+            length=auxiliary.length,
+        )
+
+    def forward_poly(
+        self,
+        signal: Tensor,
+        raw_padding_mask: Tensor | None = None,
+        *,
+        timing_reference: Tensor | None = None,
+        measure: Any = None,
+    ) -> PolyAuxiliaryOutput:
+        """Run the same encoder and Poly heads while skipping the CRF projection.
+
+        ``measure`` optionally supplies context managers for bounded profiling;
+        it does not change feature values, masks, or the default full forward.
+        """
+        from contextlib import nullcontext
+
+        if timing_reference is not None and not self.use_timing_reference:
+            raise ValueError("model does not enable timing reference")
+        checked_signal, raw_lengths = _prepare_signal(signal, raw_padding_mask)
+        encoder = _require_v5_encoder(self.basecaller)
+        with nullcontext() if measure is None else measure("encoder"):
+            features = encoder.conv(checked_signal)
+            features = encoder.transformer_encoder(features)
+            features = encoder.upsample(features)
+        feature_mask = _feature_padding_mask(
+            raw_lengths, feature_steps=features.shape[1], stride=BONITO_V5_STRIDE
+        )
+        with nullcontext() if measure is None else measure("poly_heads"):
+            return self._predict_poly(
+                features, feature_mask, raw_lengths, timing_reference
+            )
+
+    def _predict_poly(
+        self,
+        features: Tensor,
+        feature_mask: Tensor,
+        raw_lengths: Tensor,
+        timing_reference: Tensor | None,
+    ) -> PolyAuxiliaryOutput:
+        """Share head computation between full and Poly-only forward paths."""
         location = self.location_head(features, feature_mask)
         if self.use_timing_reference:
             length = self.length_head(
@@ -557,8 +650,7 @@ class BonitoV5MultiTaskModel(nn.Module):
             length = self.length_head(
                 features, feature_mask, raw_lengths_samples=raw_lengths
             )
-        return BonitoMultiTaskOutput(
-            basecall_scores=basecall_scores,
+        return PolyAuxiliaryOutput(
             encoder_features=features,
             feature_padding_mask=feature_mask,
             location=location,

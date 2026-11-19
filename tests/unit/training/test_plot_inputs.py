@@ -122,8 +122,11 @@ def test_plot_labels_use_recorded_length_objective(config: dict, label: str) -> 
     assert _plot_module["_length_loss_label"]([{"loss_config": config}]) == label
 
 
+@pytest.mark.parametrize("frozen", [False, True])
 def test_joint_history_renders_and_preserves_reference_metrics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    frozen: bool,
 ) -> None:
     """Synthetic joint logs retain CRF values and missing online decode metrics."""
     work = tmp_path / "work"
@@ -153,6 +156,10 @@ def test_joint_history_renders_and_preserves_reference_metrics(
         }
         for split in ("train", "validation")
     ]
+    if frozen:
+        del rows[0]["losses"]["basecalling_loss"]
+        rows[0]["sequence_examples"] = 0
+        rows[0]["sequence_metrics_source"] = "disabled_frozen"
     output = work / "results"
     _plot_module["_plot_training_history"](
         rows, output, plt, source=work / "synthetic.jsonl"
@@ -162,8 +169,32 @@ def test_joint_history_renders_and_preserves_reference_metrics(
     assert exported[0]["reference_edit_rate"] == ""
     assert float(exported[1]["reference_edit_rate"]) == 0.125
     assert float(exported[1]["basecalling_loss"]) == 2.0
+    if frozen:
+        assert exported[0]["basecalling_loss"] == ""
     assert (output / "training_curves.png").stat().st_size > 0
     assert (output / "loss_components.pdf").stat().st_size > 0
+    if frozen:
+        # Exercise the final summary bars too, where missing train CRF is a gap.
+        data = tmp_path / "raw"
+        data.mkdir()
+        source = work / "synthetic.jsonl"
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "plot_training.py",
+                "--work-root",
+                str(work),
+                "--data-root",
+                str(data),
+                "--log",
+                "synthetic.jsonl",
+                "--output",
+                "full-plot",
+            ],
+        )
+        _plot_module["main"]()
+        assert (work / "full-plot/epoch1_summary.png").stat().st_size > 0
 
 
 def test_status_history_renders_zero_and_twenty_nt_metrics(
@@ -256,6 +287,11 @@ def test_prediction_plots_use_numeric_lengths_and_observed_types(
     output = tmp_path / "plots"
     _plot_module["_plot_predictions"](path, output, plt, mode="all", seed=17)
     figure = figures[-1]
+    assert figure.axes[0].get_ylim() == (0, 650)
+    assert figure.axes[1].get_ylim() == (0, 350)
+    assert figure.axes[2].get_ylim() == (0, 350)
+    assert figure.axes[3].get_ylim() == (-200, 200)
+    assert all(axis.get_xlim() == (-12, 162) for axis in figure.axes)
     for axis in figure.axes:
         assert list(axis.get_xticks()) == [0, 80, 100, 150]
         at_80 = axis.transData.transform((80, 0))[0]
@@ -288,5 +324,87 @@ def test_prediction_plots_use_numeric_lengths_and_observed_types(
     assert summary["poly_types"] == list(poly_types)
     assert summary["length_axis"] == "numeric_nt"
     assert summary["plotted_pairs"] == len(rows)
+    assert summary["axis_limits"] == {
+        "count_ylim": [0, 650],
+        "prediction_ylim_nt": [0, 350],
+        "error_ylim_nt": [-200, 200],
+    }
     assert (output / "test_summary.svg").stat().st_size > 0
     assert (output / "test_summary.pdf").stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"prediction_ylim": (0, 300)}, "prediction values"),
+        ({"error_ylim": (-150, 150)}, "error values"),
+        ({"prediction_ylim": (350, 0)}, "finite and increasing"),
+        ({"error_ylim": (float("nan"), 200)}, "finite and increasing"),
+        ({"count_ymax": 0.5}, "sample counts"),
+    ],
+)
+def test_prediction_limits_reject_hidden_observations(
+    tmp_path: Path, options: dict, message: str
+) -> None:
+    """Fixed axes must never silently clip outliers, targets or sample counts."""
+    path = tmp_path / "predictions.tsv"
+    path.write_text(
+        "read_id\tsplit\tnominal_length_nt\tregression_length_nt\tpoly_type\t"
+        "supervision_mode\tlabel_source\tlabel_status\tprediction_status\n"
+        "synthetic\ttest\t150\t327\tpolyA\tlength_only\tsynthetic\t"
+        "poly_present\tok\n"
+    )
+    with pytest.raises(ValueError, match=message):
+        _plot_module["_plot_predictions"](
+            path, tmp_path / "plots", None, mode="all", seed=17, **options
+        )
+    assert not (tmp_path / "plots").exists()
+
+
+def test_prediction_cli_accepts_fixed_axis_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Render explicit larger limits through the public CLI without changing data."""
+    work, data = tmp_path / "work", tmp_path / "raw"
+    work.mkdir()
+    data.mkdir()
+    path = work / "predictions.tsv"
+    content = (
+        "read_id\tsplit\tnominal_length_nt\tregression_length_nt\tpoly_type\t"
+        "supervision_mode\tlabel_source\tlabel_status\tprediction_status\n"
+        "synthetic\ttest\t150\t400\tpolyA\tlength_only\tsynthetic\t"
+        "poly_present\tok\n"
+    )
+    path.write_text(content)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plot_training.py",
+            "--work-root",
+            str(work),
+            "--data-root",
+            str(data),
+            "--predictions",
+            "predictions.tsv",
+            "--output",
+            "plots",
+            "--prediction-ylim",
+            "0",
+            "500",
+            "--error-ylim",
+            "-300",
+            "300",
+            "--count-ymax",
+            "1000",
+        ],
+    )
+    _plot_module["main"]()
+    summary = json.loads((work / "plots/plot_summary.json").read_text())
+    assert summary["axis_limits"] == {
+        "count_ylim": [0, 1000],
+        "prediction_ylim_nt": [0, 500],
+        "error_ylim_nt": [-300, 300],
+    }
+    assert summary["plotted_pairs"] == 1
+    assert path.read_text() == content
+    assert (work / "plots/source_predictions.tsv").read_text() == content

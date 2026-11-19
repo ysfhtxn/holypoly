@@ -12,6 +12,10 @@ from pathlib import Path
 
 from holypoly.core.config import load_config
 
+PREDICTION_YLIM_NT = (0.0, 350.0)
+ERROR_YLIM_NT = (-200.0, 200.0)
+COUNT_YMAX = 650.0
+
 
 def _load_predictions(path: Path, supervision_mode: str = "all") -> tuple[list, list]:
     """Read TSV; retain failed rows in counts and finite weak labels for plots."""
@@ -304,14 +308,33 @@ def _plot_training_history(
     )
 
 
-def _plot_predictions(path: Path, output: Path, plt, *, mode: str, seed: int) -> None:
+def _plot_predictions(
+    path: Path,
+    output: Path,
+    plt,
+    *,
+    mode: str,
+    seed: int,
+    prediction_ylim: tuple[float, float] = PREDICTION_YLIM_NT,
+    error_ylim: tuple[float, float] = ERROR_YLIM_NT,
+    count_ymax: float = COUNT_YMAX,
+) -> None:
     """Plot all pairs, grouped distributions and signed errors against nominal nt.
 
     Boxes show median/IQR with 1.5-IQR whiskers. All observations, including
     outliers, are shown as dots. Seeded horizontal jitter affects display only.
     Length axes use numeric nt coordinates; only observed types are displayed.
+    Fixed limits allow comparisons between runs; insufficient limits raise rather
+    than silently hiding observations. Limits affect display, never source values.
     """
     rows, valid = _load_predictions(path, mode)
+    for name, limits in (("prediction", prediction_ylim), ("error", error_ylim)):
+        if not all(math.isfinite(value) for value in limits) or not (
+            limits[0] < limits[1]
+        ):
+            raise ValueError(f"{name} y limits must be finite and increasing")
+    if not math.isfinite(count_ymax) or count_ymax <= 0:
+        raise ValueError("count y maximum must be finite and positive")
     colors = {"none": "#999999", "polyA": "#7397B5", "polyT": "#D0A275"}
     kinds = [kind for kind in colors if any(row["poly_type"] == kind for row in rows)]
     poly_types = [kind for kind in kinds if kind != "none"]
@@ -324,6 +347,22 @@ def _plot_predictions(path: Path, output: Path, plt, *, mode: str, seed: int) ->
         }
     )
     counts = Counter((row["nominal_length_nt"], row["poly_type"]) for row in rows)
+    predictions = [row["regression_length_nt"] for row in valid]
+    errors = [row["regression_length_nt"] - row["nominal_length_nt"] for row in valid]
+    for name, limits, values in (
+        ("prediction", prediction_ylim, predictions + lengths),
+        ("error", error_ylim, errors),
+    ):
+        if min(values) < limits[0] or max(values) > limits[1]:
+            raise ValueError(
+                f"{name} values [{min(values):g}, {max(values):g}] exceed fixed "
+                f"y limits {limits}; increase --{name}-ylim for all compared plots"
+            )
+    if max(counts.values()) > count_ymax:
+        raise ValueError(
+            "sample counts exceed fixed y maximum; increase --count-ymax "
+            "for all compared plots"
+        )
     min_gap_nt = min(
         (right - left for left, right in zip(lengths, lengths[1:], strict=False)),
         default=20.0,
@@ -406,17 +445,21 @@ def _plot_predictions(path: Path, output: Path, plt, *, mode: str, seed: int) ->
         markersize=3,
         label="Nominal target",
     )
-    limit = max(max(lengths), max(row["regression_length_nt"] for row in valid)) * 1.08
     scatter_ax.plot(
-        [0, limit], [0, limit], "k--", linewidth=1, label="Prediction = nominal"
+        [0, max(lengths)],
+        [0, max(lengths)],
+        "k--",
+        linewidth=1,
+        label="Prediction = nominal",
     )
-    scatter_ax.set_xlim(-max(limit, 1) * 0.03, max(limit, 1))
-    scatter_ax.set_ylim(0, max(limit, 1))
+    count_ax.set_ylim(0, count_ymax)
+    distribution_ax.set_ylim(*prediction_ylim)
+    scatter_ax.set_ylim(*prediction_ylim)
+    error_ax.set_ylim(*error_ylim)
     error_ax.axhline(0, color="#333333", linestyle="--", linewidth=1)
-    for axis in (count_ax, distribution_ax, error_ax):
+    for axis in axes.flat:
         axis.set_xticks(lengths, [f"{length:g}" for length in lengths])
         axis.set_xlim(lengths[0] - min_gap_nt * 0.6, lengths[-1] + min_gap_nt * 0.6)
-    scatter_ax.set_xticks(lengths, [f"{length:g}" for length in lengths])
     for axis, title, ylabel in (
         (count_ax, "a  Sample counts (all exported rows)", "Number of reads"),
         (
@@ -468,6 +511,11 @@ def _plot_predictions(path: Path, output: Path, plt, *, mode: str, seed: int) ->
         "supervision_filter": mode,
         "poly_types": poly_types,
         "length_axis": "numeric_nt",
+        "axis_limits": {
+            "count_ylim": [0.0, count_ymax],
+            "prediction_ylim_nt": list(prediction_ylim),
+            "error_ylim_nt": list(error_ylim),
+        },
         "nominal_lengths_nt": lengths,
         "prediction_status_counts": dict(
             Counter(row["prediction_status"] for row in rows)
@@ -507,6 +555,28 @@ def main() -> None:
         "--supervision-mode", choices=["all", "full", "length_only"], default="all"
     )
     parser.add_argument("--seed", type=int, default=20260923)
+    parser.add_argument(
+        "--prediction-ylim",
+        type=float,
+        nargs=2,
+        metavar=("MIN_NT", "MAX_NT"),
+        default=PREDICTION_YLIM_NT,
+        help="Fixed y limits for prediction panels b/c (default: 0 350)",
+    )
+    parser.add_argument(
+        "--error-ylim",
+        type=float,
+        nargs=2,
+        metavar=("MIN_NT", "MAX_NT"),
+        default=ERROR_YLIM_NT,
+        help="Fixed signed-error y limits for panel d (default: -200 200)",
+    )
+    parser.add_argument(
+        "--count-ymax",
+        type=float,
+        default=COUNT_YMAX,
+        help="Fixed count y maximum for panel a (default: 650)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = load_config(
@@ -555,7 +625,14 @@ def main() -> None:
     )
     if args.predictions is not None:
         _plot_predictions(
-            source, output, plt, mode=args.supervision_mode, seed=args.seed
+            source,
+            output,
+            plt,
+            mode=args.supervision_mode,
+            seed=args.seed,
+            prediction_ylim=tuple(args.prediction_ylim),
+            error_ylim=tuple(args.error_ylim),
+            count_ymax=args.count_ymax,
         )
         return
     rows = _load_epoch_records(source)
@@ -582,20 +659,29 @@ def main() -> None:
         metrics.insert(-1, "basecalling_loss")
         labels.insert(-1, "Head CRF")
     for index, split in enumerate(splits):
-        values = [selected[split]["losses"][metric] for metric in metrics]
+        values = [selected[split]["losses"].get(metric, math.nan) for metric in metrics]
         positions = [x + (index - 0.5) * 0.36 for x in range(len(metrics))]
         bars = axes[0].bar(
             positions, values, width=0.36, label=split.capitalize(), color=colors[index]
         )
         axes[0].bar_label(
-            bars, labels=[f"{v:.2f}" for v in values], fontsize=7, padding=3
+            bars,
+            labels=[f"{v:.2f}" if math.isfinite(v) else "" for v in values],
+            fontsize=7,
+            padding=3,
         )
     axes[0].set_xticks(range(len(metrics)), labels)
     axes[0].tick_params(axis="x", labelsize=8)
     axes[0].set_ylabel("Epoch-average loss")
     axes[0].set_ylim(
         0,
-        max(selected[s]["losses"][metric] for s in splits for metric in metrics) * 1.24,
+        max(
+            value
+            for s in splits
+            for metric in metrics
+            if math.isfinite(value := selected[s]["losses"].get(metric, math.nan))
+        )
+        * 1.24,
     )
     axes[0].set_title("a  Loss components and total", loc="left", fontweight="bold")
     axes[0].legend(fontsize=8)

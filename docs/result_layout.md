@@ -56,6 +56,29 @@ pooling 消融及其结果汇总均使用此目录。状态校准仅使用 valid
 不归入训练验证目录。原始单工具预测产物仍保留在 `cdna_prediction`。
 定长对比入口和统计限制见 [compare_fixed_len_tools.md](compare_fixed_len_tools.md)。
 
+已归类的比较目录采用下面的布局。既有运行目录整体移动，文件内容保持不变，
+不保留旧顶层名称的符号链接；后续命令使用归类后的实际路径。
+
+```text
+tool_comparison/
+├── README.md
+├── local/
+│   ├── fixed_len/<comparison-id>/
+│   └── hek293t/<comparison-id>/
+├── published/nano3p_seq/<source-comparison-id>/
+├── sources/
+│   ├── tailfindr_paper_data/
+│   └── shuyi_polyacaller_data/
+└── comparisons/<new-comparison-id>/
+    ├── fixed_len_with_tailfindr/
+    ├── hek293t_with_shuyi/
+    ├── source_audit.json
+    └── figure_contract_and_qa.json
+```
+
+不同数据集的分布背景图放在 `comparisons/`，不得宣称为相同 read 上的工具准确率
+比较。增量流程及来源限制见 [nano3p_source_comparison.md](nano3p_source_comparison.md)。
+
 模型、训练日志和缓存仍分别使用 `models/<run-id>/`、`logs/<run-id>/` 和
 `cache/<run-id>/`。数据审计等其他结果保留独立用途目录。
 

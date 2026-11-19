@@ -1,7 +1,7 @@
 # 默认数据准备与联合训练流程
 
-常规实验以 `scripts/run_reference_joint.sh` 为主入口。数据准备在训练前独立完成；
-已有匹配 manifest 时从预检开始，不重复扫描或重新划分 read。
+常规实验以 `scripts/run_joint_training.sh` 为统一入口。数据准备先独立完成，训练从
+成品数据的预检开始。
 
 ## 1. 配置与规模检查
 
@@ -14,56 +14,45 @@
 `--max-records 10000 --per-group 20` 和新 smoke 目录验证。
 受限 BAM 前缀缺少共同 read 或长度组不能代表全数据缺组。
 
-## 2. 制作 v4 长度/状态 manifest
+## 2. 统一制作数据集
 
 ```bash
-PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+src/bonito/.venv/bin/python -m holypoly.datasets.build \
   --config configs/local.yaml \
-  --structure head-poly --signal-end-policy raw-edge \
   --bonito-bam basecalls/<sample>/basecalls.bam \
   --dorado-bam dorado_calls/<sample>/dorado_basecalls.bam \
   --pod5-dir pod5/<sample> --reference fixed_len_ref.fa \
   --output-dir metadata/experiment \
   --max-records 10000 --per-group 20 \
-  --poly-types polyA polyT --strict-balance --seed 20260923
+  --poly-types polyA polyT --seed 20260923
 ```
 
-仅 polyA 时使用 `--poly-types polyA` 并省略 `--strict-balance`。
-两方向联合时，正长度×类型及 0 nt 两方向严格均衡；稀缺组会缩减全部组。
-检查 `summary.json` 的版本、split、实际配额、拒绝原因和标签来源。
-准备命令仍保留历史 v3 默认，日常命令必须明确写出上面的 structure 和 end policy。
-详细规则及 `--stop-when-full` 的采样限制见 [v4 制作方法](prepare_dataset_v4.md)。
+默认仅预检，确认后加 `--run` 制作长度和配套序列两份 manifest。
+仅 polyA 使用 `--poly-types polyA`；联合 A/T 自动严格均衡，稀缺组会缩减全部组。
+可加 `--with-timing-reference` 同时制作可选时间参照，默认不制作。
+完整数据另用新目录，预检后改为 `--max-records 0` 和所需 `--per-group`。
 
-## 3. 从同一长度 manifest 制作 reference-head 序列 manifest
+输出按 `length/`、`sequence/`、可选 `timing/` 收纳于同一目录。
+序列 manifest 自动继承长度集的 split 和 SHA256，不能复用其他数据集的配套文件。
+检查 `dataset.json` 完成状态、实际配额、各步骤接受数量和拒绝原因。
+定义、资源报告与验收见[统一制作方法](prepare_dataset.md)。
 
-```bash
-PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.prepare_sequence \
-  --config configs/local.yaml \
-  --manifest metadata/experiment/manifest.tsv \
-  --dorado-bam dorado_calls/<sample>/dorado_basecalls.bam \
-  --reference fixed_len_ref.fa \
-  --output-dir metadata/experiment-reference-head \
-  --max-records 10000 --dry-run
-```
-
-`--dry-run` 仅读取 manifest、参考和文件元数据，不扫描 BAM 或写文件。
-确认规模后去掉它；需要覆盖分散的 read 时，经规模确认后使用 `--max-records 0`。
-序列标签来自参考 head 内部的可靠窗口，不生成标称长度的重复 A/T 序列。
-继承原 split 并记录源 manifest SHA256，不能复用其他长度集的旧配套 manifest。
-
-检查 accepted 数量、split 和失败原因，至少 train/validation 各有 accepted 窗口。
-head 筛选失败不删除原长度样本，也不保证配套数据仍完全均衡。
-筛选与坐标规则见[参考 head 序列监督](reference_joint_training.md)。
-
-## 4. 预检并启动三项联合训练
+## 3. 预检并启动三项联合训练
 
 ```bash
 GPU_ID=0 EPOCHS=5 BATCH_SIZE=32 EVAL_BATCH_SIZE=4 \
 LAMBDA_LENGTH=1 LAMBDA_STATUS=1 LAMBDA_BASECALL=0.1 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
+bash scripts/run_joint_training.sh --dataset-dir metadata/experiment --dry-run
 ```
+
+`--dataset-dir` 接受外部 work root 下的常规 v4、strict-poly-candidate-v1 或
+head-free-platform-qc-v1 成品目录。预检根据制作摘要定位最终的两张表，核验完成状态、
+SHA256、split 和配对关系，并使用摘要记录的输入样本数。常规 v4 的 head 默认是
+`legacy`，两个 QC 方法默认是 `tcn`。目录模式显式指定物理设备 `GPU_ID`。
+
+已有配套表可以按原顺序直接传入长度和序列 manifest。`run_reference_joint.sh` 和两个
+原 QC 训练脚本仍可作为兼容入口。
 
 去掉 `--dry-run` 才训练并生成测试及图表。使用单个显式 GPU，内部为 `cuda:0`。
 真实训练读取所选 POD5 signal 和模型，可能为小时级；逐轮 checkpoint 通常为 GiB 级。
@@ -77,14 +66,15 @@ total_loss = 1.0 × Huber(length, nominal_length; delta=10 nt)
            + 0.1 × Bonito_native_CTC_CRF(head_signal, reference_head)
 ```
 
-sum pooling；仅解冻 encoder 最后一个 Transformer 层和 Poly heads，原 CRF head 冻结。
+常规 v4 使用 sum pooling。默认仅解冻 encoder 最后一个 Transformer 层和 Poly heads，
+原 CRF head 冻结。
 status 为普通 CE，系数不是类别权重。location 不监督；无 failure 训练例时不验证
-failure 检测。原始 v4 `length_only` manifest 保持原样，联合入口显式开启弱 status。
+failure 检测。原始 `length_only` manifest 保持原样，联合入口显式开启弱 status。
 
-默认从原 Bonito 和新 Poly heads 开始。只有确认旧 checkpoint 未见过当前
-validation/test read 后才使用 `INITIALIZE_FROM`。重新划分 split 不能消除历史泄漏。
+默认从原 Bonito 和新 Poly heads 开始。常规 v4 使用 `INITIALIZE_FROM` 前须确认旧
+checkpoint 未见过当前 validation/test read。QC 目录仅支持新训或同一实验的 `--resume`。
 
-## 5. 选轮、测试、绘图与恢复
+## 4. 选轮、测试、绘图与恢复
 
 脚本按最佳 validation 长度指标选择 checkpoint，再运行 test 和绘图。
 输出在 `results/training_evaluation/<run>/`，训练日志及模型在 `logs/<run>/`、
@@ -93,9 +83,7 @@ validation/test read 后才使用 `INITIALIZE_FROM`。重新划分 split 不能�
 
 ```bash
 EXPERIMENT_ID=<existing-run> EPOCHS=10 GPU_ID=0 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --resume --dry-run
+bash scripts/run_joint_training.sh --dataset-dir metadata/experiment --resume --dry-run
 ```
 
 恢复使用原 manifest、模型及 loss 设置；`EPOCHS` 为目标总轮数。

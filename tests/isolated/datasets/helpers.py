@@ -89,6 +89,8 @@ def quota_setup(
             "heads.fa",
             "--pod5-dir",
             ".",
+            "--structure",
+            "head-poly-flank",
             "--chunk-size-samples",
             "960",
             "--min-flank-reads",

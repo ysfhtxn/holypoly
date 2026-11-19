@@ -11,7 +11,7 @@ from holypoly.models.model import HolypolyModel
 
 
 class JointHolypolyModel(HolypolyModel):
-    """Unfreeze only the final N v5 Transformer blocks, retaining the original CRF.
+    """Unfreeze the final N v5 Transformer blocks; N=0 freezes the full encoder.
 
     Frozen modules stay in eval mode, including batch normalization buffers.
     The basecalling output and parameter names are unchanged.
@@ -31,13 +31,15 @@ class JointHolypolyModel(HolypolyModel):
         self.basecaller.requires_grad_(False)
         stack = self.basecaller.encoder.transformer_encoder
         layers = list(stack.children())
-        if unfreeze_last_layers < 1 or unfreeze_last_layers > len(layers):
+        if unfreeze_last_layers < 0 or unfreeze_last_layers > len(layers):
             raise ValueError(
-                "unfreeze_last_layers must select existing final Transformer blocks"
+                "unfreeze_last_layers must be 0 or select existing final "
+                "Transformer blocks"
             )
         self.unfreeze_last_layers = unfreeze_last_layers
-        for layer in layers[-unfreeze_last_layers:]:
-            layer.requires_grad_(True)
+        if unfreeze_last_layers:
+            for layer in layers[-unfreeze_last_layers:]:
+                layer.requires_grad_(True)
 
     def trainable_parameters(self) -> Iterator[nn.Parameter]:
         """Yield exactly the unfrozen encoder blocks and auxiliary-head parameters."""

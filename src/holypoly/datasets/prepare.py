@@ -25,6 +25,7 @@ from uuid import UUID
 
 from holypoly.core.config import load_config
 from holypoly.datasets.length_groups import parse_nominal_length_nt
+from holypoly.datasets.signal_metadata import signal_lengths_agree
 
 VERSION = "construct-nominal-head-excluded-v3"
 HEAD_POLY_VERSION = "construct-nominal-head-poly-v4"
@@ -492,7 +493,7 @@ def write_audit(output: Path, assigned: dict[str, str], audit: dict[str, str]) -
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    """Build head-Poly v4 or legacy flank-based v3 weak-label manifests."""
+    """Build head–Poly weak labels, retaining explicit historical flank mode."""
     from pod5 import Reader
 
     from holypoly.training.data import load_training_manifest
@@ -501,6 +502,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     strict_balance = args.strict_balance
     if strict_balance and (not head_poly or set(args.poly_types) != {"polyA", "polyT"}):
         raise ValueError("--strict-balance requires head-poly and both polyA/polyT")
+    if head_poly and args.signal_end_policy is None:
+        args.signal_end_policy = "raw-edge"
     if head_poly and args.signal_end_policy != "raw-edge":
         raise ValueError("head-poly requires explicit --signal-end-policy raw-edge")
     if not head_poly and args.signal_end_policy is not None:
@@ -808,7 +811,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 # still refer to the original signal; never tolerate a full block.
                 dorado_samples = int(record.get_tag("ns"))
                 move_stride = int(record.get_tag("mv")[0])
-                if not 0 <= raw_length - dorado_samples < move_stride:
+                if not signal_lengths_agree(raw_length, dorado_samples, move_stride):
                     raise ValueError("pod5_dorado_signal_length_mismatch")
                 if head_poly:
                     candidate_start, candidate_end, head_boundary_sample = (
@@ -1123,26 +1126,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--structure",
         choices=("head-poly-flank", "head-poly"),
-        default="head-poly-flank",
-        help="head-poly selects v4 without flank inference, using length-only labels.",
+        default="head-poly",
+        help="Default: head-poly weak labels; head-poly-flank is historical only.",
     )
     parser.add_argument(
         "--signal-end-policy",
         choices=("raw-edge",),
-        help="Required for v4: raw edge bounds a candidate, not a verified Poly.",
+        help="Default for head-poly: raw-edge candidate, not a verified Poly endpoint.",
     )
     parser.add_argument("--bonito-bam", type=Path, required=True)
     parser.add_argument("--dorado-bam", type=Path, required=True)
     parser.add_argument("--pod5-dir", type=Path, required=True)
     parser.add_argument("--reference", type=Path, default=Path("fixed_len_ref.fa"))
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("metadata/poly-dataset-v3")
+        "--output-dir", type=Path, default=Path("metadata/poly-dataset")
     )
     parser.add_argument(
         "--max-records",
         type=int,
         default=10_000,
-        help="Per BAM pass; 0 scans all. Dorado is read twice.",
+        help="Per BAM pass; 0 scans all. Head-poly reads each BAM once.",
     )
     parser.add_argument(
         "--no-progress", action="store_true", help="Disable progress bars on stderr."
@@ -1157,10 +1160,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-balance",
         action="store_true",
         help=(
-            "v4 with both types: require every reference positive length/type and "
+            "Both types: require every reference positive length/type and "
             "both zero_nt orientations; downsample all to the smallest eligible "
             "count, capped by --per-group. Fail if any stratum has fewer than 3. "
-            "Split each stratum separately. Existing defaults remain unchanged."
+            "Split each stratum separately. Does not change label definitions."
         ),
     )
     parser.add_argument(
@@ -1168,7 +1171,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Pause boundary/POD5 metadata checks when every requested stratum "
-            "(including zero_nt, when referenced) reaches --per-group. Legacy v3 "
+            "(including zero_nt) reaches --per-group. Historical flank mode "
             "also requires flank QC. Continue UUID checks; sampling uses a BAM-order "
             "subset, not all eligible reads."
         ),
@@ -1188,7 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-candidate-samples",
         type=int,
         default=12,
-        help="v4 minimum real candidate size; a technical floor, not proof of Poly.",
+        help="Minimum real candidate size; a technical floor, not proof of Poly.",
     )
     parser.add_argument("--anchor-bases", type=int, default=24)
     parser.add_argument("--anchor-error-rate", type=float, default=0.1)

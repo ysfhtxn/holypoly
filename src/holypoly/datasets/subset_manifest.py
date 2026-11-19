@@ -1,4 +1,4 @@
-"""Select a small balanced v4 manifest without reading signals or changing labels."""
+"""Select a small balanced head-poly manifest, keeping signals and labels intact."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def select_subset(
             row.get("manifest_version") != HEAD_POLY_VERSION
             or row.get("supervision_mode") != "length_only"
         ):
-            raise ValueError("subset requires a v4 length_only manifest")
+            raise ValueError("subset requires a head-poly length_only manifest")
         read_id = row["read_id"]
         if not read_id or read_id in seen:
             raise ValueError("manifest contains empty or duplicate read IDs")

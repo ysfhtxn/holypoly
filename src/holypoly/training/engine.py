@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import platform
 import random
 import shutil
@@ -52,6 +53,8 @@ class CheckpointContext:
     joint_config: Mapping[str, Any] | None = None
     length_batch_size_changes: tuple[Mapping[str, Any], ...] = ()
     input_pipeline: Mapping[str, Any] | None = None
+    learning_rate_changes: tuple[Mapping[str, Any], ...] = ()
+    branch_origin: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,7 @@ def validate_one_epoch(
     device: torch.device,
     global_step: int,
     progress_desc: str | None = None,
+    poly_only: bool = False,
 ) -> EpochResult:
     """Evaluate without gradients, optionally showing batch progress on stderr."""
     require_single_cuda_device(device)
@@ -195,7 +199,7 @@ def validate_one_epoch(
     ):
         for batch in progress:
             device_batch = _batch_to_device(batch, device)
-            output = _forward_batch(model, device_batch)
+            output = _forward_batch(model, device_batch, poly_only=poly_only)
             losses = criterion(
                 output,
                 device_batch.location_targets,
@@ -275,6 +279,10 @@ def save_checkpoint(
         payload["joint_config"] = dict(context.joint_config)
     if context.length_batch_size_changes:
         payload["length_batch_size_changes"] = list(context.length_batch_size_changes)
+    if context.learning_rate_changes:
+        payload["learning_rate_changes"] = list(context.learning_rate_changes)
+    if context.branch_origin is not None:
+        payload["branch_origin"] = dict(context.branch_origin)
     if context.input_pipeline is not None:
         payload["input_pipeline"] = dict(context.input_pipeline)
     torch.save(payload, temporary_path)
@@ -289,17 +297,31 @@ def validate_joint_config(
     requested: Mapping[str, Any] | None,
     *,
     allow_batch_size_change: bool = False,
+    allow_learning_rate_change: bool = False,
 ) -> None:
-    """Require matching joint settings, optionally allowing only length batch size."""
+    """Match joint settings except explicitly permitted batch/rate changes."""
     expected = dict(requested) if requested is not None else None
     if saved == expected:
         return
-    if allow_batch_size_change and isinstance(saved, Mapping) and expected is not None:
-        sizes = (saved.get("length_batch_size"), expected.get("length_batch_size"))
-        if all(type(size) is int and size > 0 for size in sizes) and {
-            key: value for key, value in saved.items() if key != "length_batch_size"
-        } == {
-            key: value for key, value in expected.items() if key != "length_batch_size"
+    if isinstance(saved, Mapping) and expected is not None:
+        mutable_keys = set()
+        if allow_batch_size_change:
+            sizes = (saved.get("length_batch_size"), expected.get("length_batch_size"))
+            if all(type(size) is int and size > 0 for size in sizes):
+                mutable_keys.add("length_batch_size")
+        if allow_learning_rate_change:
+            for key in ("head_learning_rate", "encoder_learning_rate"):
+                rates = (saved.get(key), expected.get(key))
+                if all(
+                    isinstance(rate, (int, float))
+                    and not isinstance(rate, bool)
+                    and math.isfinite(rate)
+                    and rate > 0
+                    for rate in rates
+                ):
+                    mutable_keys.add(key)
+        if {key: value for key, value in saved.items() if key not in mutable_keys} == {
+            key: value for key, value in expected.items() if key not in mutable_keys
         }:
             return
     differing = ""
@@ -325,6 +347,7 @@ def load_checkpoint(
     loss_weights: PolyLossWeights | None = None,
     joint_config: Mapping[str, Any] | None = None,
     allow_batch_size_change: bool = False,
+    allow_learning_rate_change: bool = False,
 ) -> ResumeState:
     """Restore model, optimizer, epoch, step, and random states."""
     require_single_cuda_device(device)
@@ -335,6 +358,7 @@ def load_checkpoint(
         payload.get("joint_config"),
         joint_config,
         allow_batch_size_change=allow_batch_size_change,
+        allow_learning_rate_change=allow_learning_rate_change,
     )
     saved_loss_config = payload.get("loss_config")
     if not isinstance(saved_loss_config, Mapping):
@@ -355,6 +379,14 @@ def load_checkpoint(
     if payload.get("data_order_seed") != data_order_seed:
         raise ValueError("data order seed differs from the checkpoint")
     head_config = head_config_from_checkpoint(payload)
+    if head_config.get("head_type", "legacy") != model.head_config.get(
+        "head_type", "legacy"
+    ):
+        raise ValueError("head architecture differs from the checkpoint")
+    if head_config.get("head_type") == "tcn":
+        for name in ("tcn_length_sum_scale", "tcn_length_features"):
+            if head_config[name] != model.head_config[name]:
+                raise ValueError(f"{name} differs from the checkpoint")
     keys: tuple[str, ...] = ("length_head_mode", "hidden_features", "dropout")
     if "head_config" not in payload:
         keys = ("length_head_mode", "hidden_features")
@@ -364,8 +396,32 @@ def load_checkpoint(
         model.head_config.get("use_timing_reference", False)
     ):
         raise ValueError("timing reference architecture differs from the checkpoint")
+    requested_rates = {}
+    if allow_learning_rate_change and joint_config is not None:
+        requested_rates = {
+            "poly_heads": joint_config["head_learning_rate"],
+            "encoder_tail": joint_config["encoder_learning_rate"],
+        }
+        for groups in (
+            optimizer.param_groups,
+            payload["optimizer_state_dict"]["param_groups"],
+        ):
+            if (
+                len(groups) != 2
+                or {group.get("group_name") for group in groups}
+                != requested_rates.keys()
+            ):
+                raise ValueError("joint optimizer parameter group names differ")
+        if [group["group_name"] for group in optimizer.param_groups] != [
+            group["group_name"]
+            for group in payload["optimizer_state_dict"]["param_groups"]
+        ]:
+            raise ValueError("joint optimizer parameter group order differs")
     model.load_state_dict(payload["model_state_dict"])
     optimizer.load_state_dict(payload["optimizer_state_dict"])
+    for group in optimizer.param_groups:
+        if requested_rates:
+            group["lr"] = requested_rates[group["group_name"]]
     random.setstate(payload["python_random_state"])
     torch.set_rng_state(payload["torch_random_state"].cpu())
     torch.cuda.set_rng_state_all(
@@ -398,17 +454,14 @@ def append_loss_log(
 
 
 class _MetricAccumulator:
+    """Accumulate detached metrics on-device, transferring only at epoch end."""
+
     def __init__(self) -> None:
         self.examples = 0
         self.batches = 0
-        self.loss_sums: dict[str, float] = {}
-        self.location_confusion = torch.zeros((len(PolyClass), len(PolyClass)))
-        self.poly_intersection = 0
-        self.poly_union = 0
-        self.length_absolute_error = 0.0
-        self.length_examples = 0
-        self.status_correct = 0
-        self.status_examples = 0
+        self.loss_sums: dict[str, Tensor] = {}
+        self.location_confusion: Tensor | None = None
+        self.totals: Tensor | None = None
 
     def update(
         self,
@@ -422,68 +475,70 @@ class _MetricAccumulator:
         for name, value in losses.items():
             if name.endswith("_examples"):
                 continue
-            self.loss_sums[name] = (
-                self.loss_sums.get(name, 0.0)
-                + float(value.detach().item()) * batch_size
-            )
+            weighted = value.detach().double() * batch_size
+            self.loss_sums[name] = self.loss_sums.get(name, 0.0) + weighted
 
         valid = (~output.feature_padding_mask) & (batch.location_targets != -100)
         predictions = output.location.location_logits.argmax(dim=-1)
         targets = batch.location_targets
-        for target_class in PolyClass:
-            for predicted_class in PolyClass:
-                count = torch.count_nonzero(
-                    valid
-                    & (targets == int(target_class))
-                    & (predictions == int(predicted_class))
-                )
-                self.location_confusion[target_class, predicted_class] += count.cpu()
+        classes = len(PolyClass)
+        confusion = torch.zeros(
+            classes * classes, dtype=torch.long, device=predictions.device
+        )
+        indices = targets.clamp_min(0) * classes + predictions
+        confusion.scatter_add_(0, indices.flatten(), valid.long().flatten())
+        confusion = confusion.reshape(classes, classes)
+        self.location_confusion = (
+            confusion
+            if self.location_confusion is None
+            else self.location_confusion + confusion
+        )
         predicted_poly = predictions != int(PolyClass.BACKGROUND)
         target_poly = targets != int(PolyClass.BACKGROUND)
-        self.poly_intersection += int(
-            torch.count_nonzero(valid & predicted_poly & target_poly).item()
-        )
-        self.poly_union += int(
-            torch.count_nonzero(valid & (predicted_poly | target_poly)).item()
-        )
-
         length_mask = batch.status_targets != int(ReadStatus.FAILURE)
-        if torch.any(length_mask):
-            self.length_absolute_error += float(
-                torch.abs(
-                    output.length.length_nt[length_mask]
-                    - batch.true_length_nt[length_mask]
-                )
-                .sum()
-                .item()
-            )
-            self.length_examples += int(length_mask.sum().item())
+        absolute_error = torch.where(
+            length_mask,
+            (output.length.length_nt.detach() - batch.true_length_nt).abs(),
+            0.0,
+        ).sum()
         shared_status = (
             output.location.status_logits + output.length.status_logits
         ) / 2
         valid_status = batch.status_targets != -100
-        self.status_examples += int(valid_status.sum().item())
-        self.status_correct += int(
-            torch.count_nonzero(
-                valid_status & (shared_status.argmax(dim=-1) == batch.status_targets)
-            ).item()
-        )
+        totals = torch.stack(
+            [
+                torch.count_nonzero(valid & predicted_poly & target_poly),
+                torch.count_nonzero(valid & (predicted_poly | target_poly)),
+                absolute_error,
+                length_mask.sum(),
+                torch.count_nonzero(
+                    valid_status
+                    & (shared_status.argmax(dim=-1) == batch.status_targets)
+                ),
+                valid_status.sum(),
+            ]
+        ).double()
+        self.totals = totals if self.totals is None else self.totals + totals
 
     def result(self, global_step: int) -> EpochResult:
         if self.batches == 0 or self.examples == 0:
             raise ValueError("epoch must contain at least one batch")
-        losses = {name: value / self.examples for name, value in self.loss_sums.items()}
-        total_locations = float(self.location_confusion.sum().item())
-        correct_locations = float(self.location_confusion.diag().sum().item())
+        assert self.location_confusion is not None and self.totals is not None
+        losses = {
+            name: float(value.item()) / self.examples
+            for name, value in self.loss_sums.items()
+        }
+        confusion = self.location_confusion.cpu()
+        intersection, union, error, length_count, status_correct, status_count = (
+            self.totals.cpu().tolist()
+        )
+        total_locations = float(confusion.sum().item())
+        correct_locations = float(confusion.diag().sum().item())
         f1_values = []
         for class_index in range(len(PolyClass)):
-            true_positive = float(self.location_confusion[class_index, class_index])
-            false_positive = (
-                float(self.location_confusion[:, class_index].sum()) - true_positive
-            )
-            false_negative = (
-                float(self.location_confusion[class_index, :].sum()) - true_positive
-            )
+            true_positive = float(confusion[class_index, class_index])
+            false_positive = float(confusion[:, class_index].sum()) - true_positive
+            false_negative = float(confusion[class_index, :].sum()) - true_positive
             denominator = 2 * true_positive + false_positive + false_negative
             f1_values.append(
                 0.0 if denominator == 0 else 2 * true_positive / denominator
@@ -497,20 +552,10 @@ class _MetricAccumulator:
                 0.0 if total_locations == 0 else correct_locations / total_locations
             ),
             location_macro_f1=sum(f1_values) / len(f1_values),
-            poly_iou=(
-                0.0
-                if self.poly_union == 0
-                else self.poly_intersection / self.poly_union
-            ),
-            length_mae_nt=(
-                float("nan")
-                if self.length_examples == 0
-                else self.length_absolute_error / self.length_examples
-            ),
+            poly_iou=0.0 if union == 0 else intersection / union,
+            length_mae_nt=(float("nan") if length_count == 0 else error / length_count),
             status_accuracy=(
-                float("nan")
-                if self.status_examples == 0
-                else self.status_correct / self.status_examples
+                float("nan") if status_count == 0 else status_correct / status_count
             ),
         )
 
@@ -532,15 +577,18 @@ def _batch_to_device(
     )
 
 
-def _forward_batch(model: HolypolyModel, batch: PolyTrainingBatch) -> Any:
+def _forward_batch(
+    model: HolypolyModel, batch: PolyTrainingBatch, *, poly_only: bool = False
+) -> Any:
     """Preserve the legacy call signature when timing fusion is disabled."""
+    forward = model.forward_poly if poly_only else model
     if batch.timing_reference is not None:
-        return model(
+        return forward(
             batch.signal,
             batch.raw_padding_mask,
             timing_reference=batch.timing_reference,
         )
-    return model(batch.signal, batch.raw_padding_mask)
+    return forward(batch.signal, batch.raw_padding_mask)
 
 
 def _ensure_output_is_safe(

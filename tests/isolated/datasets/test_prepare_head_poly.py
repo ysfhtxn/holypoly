@@ -125,7 +125,7 @@ def test_v4_no_flank_pipeline_masks_all_location_and_status_labels(
     ]
     args, requested = quota_setup(tmp_path, monkeypatch, records)
     args.structure = "head-poly"
-    args.signal_end_policy = "raw-edge"
+    args.signal_end_policy = None
     args.stop_when_full = False
     args.per_group = 4
 
@@ -136,6 +136,7 @@ def test_v4_no_flank_pipeline_masks_all_location_and_status_labels(
     monkeypatch.setattr(module, "flank_boundary", forbidden)
     summary = module.prepare(args)
     assert summary["manifest_version"] == module.HEAD_POLY_VERSION
+    assert summary["arguments"]["signal_end_policy"] == "raw-edge"
     assert summary["flank_status"] == "not_applicable_no_flank"
     assert summary["0A_candidate_reads"] == 0
     assert summary["supervision_counts"] == {"length_only": 10}
@@ -192,7 +193,7 @@ def test_v4_quota_pause_needs_no_flank_and_resumes_after_duplicate(
     assert "BAM-order subsets" in summary["limitations"]
 
 
-def test_v4_requires_explicit_candidate_policy(tmp_path: Path) -> None:
+def test_default_structure_uses_raw_edge_without_legacy_flank() -> None:
     args = module.build_parser().parse_args(
         [
             "--bonito-bam",
@@ -201,12 +202,11 @@ def test_v4_requires_explicit_candidate_policy(tmp_path: Path) -> None:
             "unused.bam",
             "--pod5-dir",
             ".",
-            "--structure",
-            "head-poly",
         ]
     )
-    with pytest.raises(ValueError, match="explicit"):
-        module.prepare(args)
+    assert args.structure == "head-poly"
+    assert args.signal_end_policy is None
+    assert args.output_dir == Path("metadata/poly-dataset")
 
 
 STRICT_GROUPS = {

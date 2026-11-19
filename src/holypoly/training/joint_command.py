@@ -25,6 +25,13 @@ from holypoly.core.config import load_config
 from holypoly.core.result_paths import training_result_dir
 from holypoly.datasets.prepare_sequence import sha256
 from holypoly.models.joint_model import JointHolypolyModel, create_joint_optimizer
+from holypoly.models.length_head_config import (
+    DEFAULT_TCN_LENGTH_FEATURES,
+    DEFAULT_TCN_LENGTH_SUM_SCALE,
+    TCN_LENGTH_FEATURES,
+    validate_tcn_length_features,
+    validate_tcn_length_sum_scale,
+)
 from holypoly.models.model import head_config_from_checkpoint, load_bonito_v5_model
 from holypoly.training.data import (
     ManifestSplit,
@@ -42,6 +49,7 @@ from holypoly.training.engine import (
     set_random_seed,
     validate_joint_config,
 )
+from holypoly.training.joint_branch import materialize_joint_branch, plan_joint_branch
 from holypoly.training.joint_engine import (
     joint_log_record,
     train_joint_epoch,
@@ -50,6 +58,7 @@ from holypoly.training.joint_engine import (
 )
 from holypoly.training.loss_config import normalize_loss_config
 from holypoly.training.losses import PolyAuxiliaryLoss, PolyLossWeights
+from holypoly.training.progress import timed_stage
 from holypoly.training.run_validation import (
     git_commit,
     manifest_summary,
@@ -76,18 +85,26 @@ def _validate_resume_metadata(
     target_epochs: int,
     allow_batch_size_change: bool,
     recorded_utc: str,
+    allow_learning_rate_change: bool = True,
+    historical_branch: bool = False,
 ) -> list[dict[str, Any]]:
     """Validate mixed-batch epoch history without rewriting any completed records."""
     saved_config = payload.get("joint_config")
     validate_joint_config(
-        saved_config, joint_config, allow_batch_size_change=allow_batch_size_change
+        saved_config,
+        joint_config,
+        allow_batch_size_change=allow_batch_size_change,
+        allow_learning_rate_change=allow_learning_rate_change,
     )
     epoch, step = payload["epoch"], payload["global_step"]
     if target_epochs <= epoch:
         raise ValueError("resume target epochs must exceed checkpoint epoch")
     if not log.is_file():
         raise ValueError("resume requires the existing complete training log")
-    history = [json.loads(line) for line in log.read_text().splitlines()]
+    history_lines = log.read_text().splitlines()
+    if historical_branch:
+        history_lines = history_lines[: 2 * epoch]
+    history = [json.loads(line) for line in history_lines]
     expected = [
         (index, split)
         for index in range(1, epoch + 1)
@@ -103,8 +120,13 @@ def _validate_resume_metadata(
         train_config = history[index].get("joint_config")
         if train_config != history[index + 1].get("joint_config"):
             raise ValueError("training/validation joint configurations differ")
-        # Older epochs retain their actual batch size, even on a later strict resume.
-        validate_joint_config(train_config, saved_config, allow_batch_size_change=True)
+        # Historical settings remain valid even on a later strict resume.
+        validate_joint_config(
+            train_config,
+            saved_config,
+            allow_batch_size_change=True,
+            allow_learning_rate_change=True,
+        )
     if not (result_dir / "basecalling_validation_baseline.json").is_file():
         raise ValueError("resume requires the original basecalling validation baseline")
     summary_path = result_dir / "run_summary.json"
@@ -116,6 +138,7 @@ def _validate_resume_metadata(
         original_summary.get("joint_config"),
         saved_config,
         allow_batch_size_change=True,
+        allow_learning_rate_change=True,
     )
     changes = list(payload.get("length_batch_size_changes", []))
     old_size = saved_config["length_batch_size"]
@@ -128,6 +151,26 @@ def _validate_resume_metadata(
                 "from_batch_size": old_size,
                 "to_batch_size": new_size,
                 "recorded_utc": recorded_utc,
+            }
+        )
+    return changes
+
+
+def _resume_learning_rate_changes(
+    payload: dict[str, Any], joint_config: dict[str, Any], recorded_utc: str
+) -> list[dict[str, Any]]:
+    """Append explicit rate provenance without modifying checkpoint metadata."""
+    changes = list(payload.get("learning_rate_changes", []))
+    saved = payload["joint_config"]
+    keys = ("head_learning_rate", "encoder_learning_rate")
+    if any(saved[key] != joint_config[key] for key in keys):
+        changes.append(
+            {
+                "after_epoch": payload["epoch"],
+                "global_step": payload["global_step"],
+                "recorded_utc": recorded_utc,
+                **{f"from_{key}": saved[key] for key in keys},
+                **{f"to_{key}": joint_config[key] for key in keys},
             }
         )
     return changes
@@ -151,6 +194,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help="Archived joint checkpoint to branch from; requires a new run-id",
+    )
+    parser.add_argument(
+        "--allow-learning-rate-change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply requested head/encoder learning rates after optimizer restore "
+            "on resume (default); --no-allow-learning-rate-change requires matching"
+        ),
+    )
+    parser.add_argument(
         "--allow-batch-size-change",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -163,6 +220,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--sequence-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--frozen-sequence-monitor",
+        choices=("auto", "baseline", "per-step"),
+        default="auto",
+        help=(
+            "Frozen encoder only: auto uses baseline-only monitoring for new runs "
+            "and preserves the saved policy on resume (old checkpoints: per-step)"
+        ),
+    )
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        default=0,
+        help=(
+            "Time N train batches after 5 warmup batches in the first new/resumed "
+            "epoch; 0 disables synchronized profiling"
+        ),
+    )
     parser.add_argument(
         "--prefetch-batches",
         type=int,
@@ -177,6 +252,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-size-samples", type=int, default=12000)
     parser.add_argument("--hidden-features", type=int, default=128)
+    parser.add_argument("--head-type", choices=("legacy", "tcn"), default="legacy")
+    parser.add_argument(
+        "--tcn-length-features",
+        choices=TCN_LENGTH_FEATURES,
+        default=DEFAULT_TCN_LENGTH_FEATURES,
+        help="TCN length inputs: scaled sum + mean + log1p(valid frames) by default; "
+        "sum restores the historical MLP",
+    )
+    parser.add_argument(
+        "--tcn-length-sum-scale",
+        type=float,
+        default=DEFAULT_TCN_LENGTH_SUM_SCALE,
+        help="Fixed multiplier before the TCN length MLP (default: 0.001); "
+        "independent of each read's valid frame count",
+    )
     parser.add_argument(
         "--use-timing-reference",
         action="store_true",
@@ -193,11 +283,16 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Use v4 weak present/zero labels (default); location stays ignored. "
+            "Use construct weak present/zero labels (default); location stays ignored. "
             "--no-supervise-status is for explicit ablations/legacy two-loss resumes."
         ),
     )
-    parser.add_argument("--unfreeze-last-layers", type=int, default=1)
+    parser.add_argument(
+        "--unfreeze-last-layers",
+        type=int,
+        default=1,
+        help="Final Transformer blocks to train; 0 freezes the entire encoder",
+    )
     parser.add_argument("--huber-delta-nt", type=float, default=10.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=2.0)
@@ -213,19 +308,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
     """Validate both manifests before reading model weights, then train one GPU."""
+    validate_tcn_length_sum_scale(args.tcn_length_sum_scale)
+    validate_tcn_length_features(args.tcn_length_features)
+    if args.head_type == "tcn" and (
+        args.hidden_features != 128 or args.use_timing_reference
+    ):
+        raise ValueError("tcn requires hidden-features=128 and no timing reference")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.run_id):
         raise ValueError("run-id must be one directory name")
-    if args.prefetch_batches < 0 or args.pod5_reader_cache_size < 0:
+    if (
+        args.prefetch_batches < 0
+        or args.pod5_reader_cache_size < 0
+        or args.profile_batches < 0
+    ):
         raise ValueError(
-            "prefetch-batches and pod5-reader-cache-size must be nonnegative"
+            "prefetch-batches, pod5-reader-cache-size and profile-batches "
+            "must be nonnegative"
         )
+    if args.unfreeze_last_layers < 0:
+        raise ValueError("unfreeze_last_layers must be nonnegative")
     for key in (
         "epochs",
         "batch_size",
         "sequence_batch_size",
         "chunk_size_samples",
         "hidden_features",
-        "unfreeze_last_layers",
     ):
         if getattr(args, key) < 1:
             raise ValueError(f"{key} must be positive")
@@ -243,6 +350,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         or not math.isfinite(args.weight_decay)
         or args.weight_decay < 0
         or (args.resume and args.initialize_from is not None)
+        or (args.resume_from is not None and (args.resume or args.initialize_from))
     ):
         raise ValueError(
             "invalid chunk size, seed, weight decay or resume/initialization"
@@ -317,7 +425,14 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         for r in records
     ):
         raise ValueError(
-            "reference-head joint training requires unchanged v4 length_only labels"
+            "reference-head joint training requires unchanged "
+            "head-poly length_only labels"
+        )
+    input_sizes = {record.input_length_samples for record in records}
+    if input_sizes != {args.chunk_size_samples}:
+        raise ValueError(
+            f"manifest model_input_samples must match --chunk-size-samples "
+            f"{args.chunk_size_samples}; found {sorted(input_sizes)}"
         )
     sequence_records = load_sequence_manifest(
         sequence_path, records, source_manifest_sha256=sha256(manifest), data_root=data
@@ -347,7 +462,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         .get("transformer_encoder", {})
         .get("depth")
     )
-    if not isinstance(depth, int) or not 1 <= args.unfreeze_last_layers <= depth:
+    if not isinstance(depth, int) or not 0 <= args.unfreeze_last_layers <= depth:
         raise ValueError("model config must specify a supported v5 Transformer depth")
     state_len = model_config["model"]["seqdist"]["state_len"]
     if any(len(row.sequence_target) < state_len for row in sequence_records):
@@ -400,6 +515,14 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         "boundary_source": "dorado_moves_provisional",
         "crf_frozen": True,
     }
+    if args.head_type != "legacy":
+        joint_config["head_type"] = args.head_type
+        # Missing in old runs means an unscaled sum; retain their resume config
+        # when the user explicitly requests the matching multiplier of 1.
+        if args.tcn_length_sum_scale != 1.0:
+            joint_config["tcn_length_sum_scale"] = args.tcn_length_sum_scale
+        if args.tcn_length_features != "sum":
+            joint_config["tcn_length_features"] = args.tcn_length_features
     if args.supervise_status:
         # Absence preserves exact configuration equality for old joint resumes.
         joint_config.update(
@@ -467,24 +590,59 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
             for split in ManifestSplit
         }
     resume_position = None
+    frozen_monitor = "baseline"
     batch_size_changes: list[dict[str, Any]] = []
-    if args.resume:
+    learning_rate_changes: list[dict[str, Any]] = []
+    branch = None
+    restore_checkpoint = checkpoint
+    restore_log, restore_result = log, result_dir
+    if args.resume_from is not None:
+        branch = plan_joint_branch(
+            args.resume_from,
+            output_checkpoint=checkpoint,
+            output_log=log,
+            output_result=result_dir,
+            work_root=work,
+            data_root=data,
+            project_root=project,
+        )
+        restore_checkpoint = branch.checkpoint
+        restore_log, restore_result = branch.parent_log, branch.parent_result
+    if args.resume or branch is not None:
         # mmap touches metadata only here; no GPU allocation or POD5 signal reads.
         payload = torch.load(
-            checkpoint, map_location="cpu", mmap=True, weights_only=False
+            restore_checkpoint, map_location="cpu", mmap=True, weights_only=False
         )
+        if branch is not None and payload["epoch"] != branch.epoch:
+            raise ValueError("resume-from filename and checkpoint epoch differ")
         batch_size_changes = _validate_resume_metadata(
             payload,
-            log=log,
-            result_dir=result_dir,
+            log=restore_log,
+            result_dir=restore_result,
             joint_config=joint_config,
             target_epochs=args.epochs,
             allow_batch_size_change=args.allow_batch_size_change,
+            allow_learning_rate_change=args.allow_learning_rate_change,
             recorded_utc=summary["started_utc"],
+            historical_branch=branch is not None,
         )
+        original_summary = json.loads((restore_result / "run_summary.json").read_text())
+        if branch is not None:
+            summary["branch_origin"] = branch.provenance(payload["global_step"])
+            summary["initialize_from"] = original_summary.get("initialize_from")
+            summary["initialization"] = original_summary.get("initialization")
+        elif "branch_origin" in original_summary:
+            summary["branch_origin"] = original_summary["branch_origin"]
         resume_position = (payload["epoch"], payload["global_step"])
+        learning_rate_changes = _resume_learning_rate_changes(
+            payload, joint_config, summary["started_utc"]
+        )
+        frozen_monitor = payload.get("input_pipeline", {}).get(
+            "frozen_sequence_monitor", "per-step"
+        )
         del payload
         summary["length_batch_size_changes"] = batch_size_changes
+        summary["learning_rate_changes"] = learning_rate_changes
         if batch_size_changes:
             print(
                 "Length batch size changes are recorded. One sequence batch per "
@@ -493,12 +651,28 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
                 file=sys.stderr,
                 flush=True,
             )
+    if args.frozen_sequence_monitor != "auto":
+        frozen_monitor = args.frozen_sequence_monitor
+    baseline_only = args.unfreeze_last_layers == 0 and frozen_monitor == "baseline"
+    summary["input_pipeline"].update(
+        poly_only_forward=True,
+        frozen_sequence_monitor=frozen_monitor,
+        profile_batches=args.profile_batches,
+    )
     print(json.dumps(summary, sort_keys=True), flush=True)
     print(
-        "Single selected GPU; partial encoder backward increases memory use. "
-        f"{len(sequence_records)} head chunks plus original length reads; "
-        "one head batch per length update. "
-        f"Snapshots roughly {(args.epochs + 1) * 0.4:.1f} GiB; "
+        (
+            "Single selected GPU; encoder fully frozen. "
+            if args.unfreeze_last_layers == 0
+            else "Single selected GPU; partial encoder backward increases memory use. "
+        )
+        + f"{len(sequence_records)} head chunks plus original length reads; "
+        + (
+            "Head sequences are baseline monitoring only. "
+            if baseline_only
+            else "One head batch per length update. "
+        )
+        + f"Snapshots roughly {(args.epochs + 1) * 0.4:.1f} GiB; "
         "runtime may be hours. "
         "Start with --dry-run, then 1-5 epochs on a small manifest.",
         file=sys.stderr,
@@ -570,6 +744,9 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         hidden_features=args.hidden_features,
         dropout=0.0,
         use_timing_reference=args.use_timing_reference,
+        head_type=args.head_type,
+        tcn_length_sum_scale=args.tcn_length_sum_scale,
+        tcn_length_features=args.tcn_length_features,
     ).to(device)
     optimizer = create_joint_optimizer(
         model,
@@ -607,9 +784,9 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
             "loss_config": payload["loss_config"],
         }
         del payload
-    if args.resume:
+    if args.resume or branch is not None:
         state = load_checkpoint(
-            checkpoint,
+            restore_checkpoint,
             model=model,
             optimizer=optimizer,
             device=device,
@@ -617,6 +794,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
             loss_weights=weights,
             joint_config=joint_config,
             allow_batch_size_change=args.allow_batch_size_change,
+            allow_learning_rate_change=args.allow_learning_rate_change,
         )
         start_epoch, step = state.epoch, state.global_step
         if (start_epoch, step) != resume_position:
@@ -629,17 +807,25 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         work_root=work,
         protected_paths=(manifest, sequence_path, log),
     )
-    result_dir.mkdir(parents=True, exist_ok=args.resume)
-    log.parent.mkdir(parents=True, exist_ok=args.resume)
+    if branch is not None:
+        materialize_joint_branch(branch, summary)
+    result_dir.mkdir(parents=True, exist_ok=args.resume or branch is not None)
+    log.parent.mkdir(parents=True, exist_ok=args.resume or branch is not None)
     baseline_path = result_dir / "basecalling_validation_baseline.json"
     summary["parameter_counts"] = model.parameter_counts()
-    if not args.resume:
-        baseline = validate_sequences(
-            model,
-            sequence_loaders[ManifestSplit.VALIDATION],
-            device=device,
-            prefetch_batches=args.prefetch_batches,
-        )
+    timings: dict[str, float] = {}
+    summary["stage_seconds"] = timings
+    baseline: dict[str, Any] | None = None
+    if not args.resume and branch is None:
+        with timed_stage("Initial head sequence validation", device, timings):
+            baseline = validate_sequences(
+                model,
+                sequence_loaders[ManifestSplit.VALIDATION],
+                device=device,
+                prefetch_batches=args.prefetch_batches,
+                progress_desc="Initial head sequence validation",
+                total_examples=sequence_counts[ManifestSplit.VALIDATION.value],
+            )
         baseline_path.write_text(
             json.dumps(
                 {**baseline, "initialize_from": summary["initialize_from"]}, indent=2
@@ -649,6 +835,29 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         (result_dir / "run_summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )
+    elif baseline_only:
+        baseline = json.loads(baseline_path.read_text())
+    if baseline_only:
+        if (
+            baseline is None
+            or baseline.get("sequence_examples")
+            != sequence_counts[ManifestSplit.VALIDATION.value]
+            or not all(
+                isinstance(baseline.get(key), (int, float))
+                and math.isfinite(baseline[key])
+                for key in ("basecalling_loss", "reference_edit_rate")
+            )
+        ):
+            raise ValueError("invalid frozen sequence validation baseline")
+        baseline = {
+            key: baseline[key]
+            for key in (
+                "basecalling_loss",
+                "sequence_examples",
+                "reference_edit_rate",
+                "reference_bases",
+            )
+        }
     context = CheckpointContext(
         random_seed=args.random_seed,
         bonito_commit=git_commit(project / "src" / "bonito"),
@@ -660,24 +869,31 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         joint_config=joint_config,
         length_batch_size_changes=tuple(batch_size_changes),
         input_pipeline=summary["input_pipeline"],
+        learning_rate_changes=tuple(learning_rate_changes),
+        branch_origin=summary.get("branch_origin"),
     )
     criterion = PolyAuxiliaryLoss(weights)
     for epoch in range(start_epoch + 1, args.epochs + 1):
         length_generators[0].manual_seed(args.random_seed + epoch)
         length_generators[1].manual_seed(args.random_seed + epoch + 1_000_000)
-        training, train_sequence = train_joint_epoch(
-            model,
-            loaders[ManifestSplit.TRAIN],
-            sequence_loaders[ManifestSplit.TRAIN],
-            criterion,
-            optimizer,
-            lambda_basecall=args.lambda_basecall,
-            device=device,
-            gradient_clip_norm=args.gradient_clip_norm,
-            global_step=step,
-            progress_desc=f"Joint epoch {epoch}/{args.epochs}",
-            prefetch_batches=args.prefetch_batches,
-        )
+        profile: dict[str, object] = {}
+        with timed_stage(f"Epoch {epoch}/{args.epochs} train", device, timings):
+            training, train_sequence = train_joint_epoch(
+                model,
+                loaders[ManifestSplit.TRAIN],
+                sequence_loaders[ManifestSplit.TRAIN],
+                criterion,
+                optimizer,
+                lambda_basecall=args.lambda_basecall,
+                device=device,
+                gradient_clip_norm=args.gradient_clip_norm,
+                global_step=step,
+                progress_desc=f"Epoch {epoch}/{args.epochs} train",
+                prefetch_batches=args.prefetch_batches,
+                monitor_frozen_sequences=not baseline_only,
+                profile_batches=args.profile_batches if epoch == start_epoch + 1 else 0,
+                profile_result=profile,
+            )
         step = training.global_step
         validation, val_sequence = validate_joint_epoch(
             model,
@@ -687,37 +903,49 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
             device=device,
             global_step=step,
             prefetch_batches=args.prefetch_batches,
+            progress_desc=f"Epoch {epoch}/{args.epochs} val",
+            sequence_examples=sequence_counts[ManifestSplit.VALIDATION.value],
+            cached_sequence=baseline if baseline_only else None,
+            timings=timings,
         )
         with log.open("a") as stream:
             for split_name, metrics, seq in (
                 ("train", training, train_sequence),
                 ("validation", validation, val_sequence),
             ):
-                stream.write(
-                    json.dumps(
-                        joint_log_record(
-                            metrics,
-                            seq,
-                            epoch=epoch,
-                            split=split_name,
-                            lambda_basecall=args.lambda_basecall,
-                            loss_config=asdict(weights),
-                            joint_config=joint_config,
-                        )
-                    )
-                    + "\n"
+                row = joint_log_record(
+                    metrics,
+                    seq,
+                    epoch=epoch,
+                    split=split_name,
+                    lambda_basecall=args.lambda_basecall,
+                    loss_config=asdict(weights),
+                    joint_config=joint_config,
                 )
-        save_checkpoint(
-            checkpoint,
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            global_step=step,
-            context=context,
-            data_root=data,
-            work_root=work,
-            archive_epoch=True,
-        )
+                row["stage_seconds"] = {
+                    key: seconds
+                    for key, seconds in timings.items()
+                    if key.startswith(f"Epoch {epoch}/")
+                }
+                if learning_rate_changes:
+                    row["learning_rate_changes"] = learning_rate_changes
+                if split_name == "train" and profile:
+                    row["batch_profile"] = profile
+                stream.write(json.dumps(row) + "\n")
+        with timed_stage(
+            f"Epoch {epoch}/{args.epochs} save checkpoint", device, timings
+        ):
+            save_checkpoint(
+                checkpoint,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                global_step=step,
+                context=context,
+                data_root=data,
+                work_root=work,
+                archive_epoch=True,
+            )
         print(
             json.dumps(
                 {
@@ -754,12 +982,15 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
             payload = torch.load(best_path, map_location="cpu", weights_only=False)
             model.load_state_dict(payload["model_state_dict"], strict=True)
             del payload
-            test = validate_sequences(
-                model,
-                sequence_loaders[ManifestSplit.TEST],
-                device=device,
-                prefetch_batches=args.prefetch_batches,
-            )
+            with timed_stage("Best checkpoint head sequence test", device, timings):
+                test = validate_sequences(
+                    model,
+                    sequence_loaders[ManifestSplit.TEST],
+                    device=device,
+                    prefetch_batches=args.prefetch_batches,
+                    progress_desc="Best checkpoint head sequence test",
+                    total_examples=sequence_counts[ManifestSplit.TEST.value],
+                )
             with test_path.open("x") as stream:
                 stream.write(
                     json.dumps(
@@ -774,6 +1005,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
                     + "\n"
                 )
     summary["finished_utc"] = datetime.now(UTC).isoformat()
+    summary["stage_seconds"] = timings
     # Preserve the original run's initialization provenance across continuation.
     summary_path = result_dir / "run_summary.json"
     if args.resume:
@@ -781,6 +1013,10 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
         summary["initialize_from"] = original_summary.get("initialize_from")
         summary["initialization"] = original_summary.get("initialization")
         summary["started_utc"] = original_summary["started_utc"]
+        summary["stage_seconds"] = {
+            **original_summary.get("stage_seconds", {}),
+            **timings,
+        }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 

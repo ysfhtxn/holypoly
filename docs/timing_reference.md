@@ -6,6 +6,14 @@
 
 ## 如何使用
 
+新数据统一通过[制作数据集](prepare_dataset.md)的 `--with-timing-reference`
+配套生成，表格位于 `<dataset>/timing/timing_reference.tsv`。下面保留已有数据
+补配和消融入口；制作表格与训练是否启用参照分别控制。
+
+制作时与长度/序列步骤统一允许 Dorado 省略不足一个 move stride 的末尾样本，
+不再要求 `ns` 与 POD5 长度逐样本相等。旧参照表不会自动更新，
+需要该修正时使用新的输出目录重新补配。
+
 先设置 `HOLYPOLY_DATA_ROOT`、`HOLYPOLY_WORK_ROOT`，并使用匹配的数据集。
 以下占位路径需替换；manifest 和输出相对 work root，BAM 相对 data root。
 BAM 必须包含完整 read 的序列、质量值和 `mv/ts/ns` 标签。
@@ -15,8 +23,8 @@ BAM 必须包含完整 read 的序列、质量值和 `mv/ts/ns` 标签。
 ```bash
 GPU_ID=0 PER_GROUP=100 EPOCHS=3 BATCH_SIZE=8 \
 bash scripts/run_timing_reference_smoke.sh \
-  "metadata/<dataset>/manifest.tsv" \
-  "metadata/<dataset>-reference-head/sequence_manifest.tsv" \
+  "metadata/<dataset>/length/manifest.tsv" \
+  "metadata/<dataset>/sequence/sequence_manifest.tsv" \
   "dorado_calls/<sample>/dorado_basecalls.bam" configs/local.yaml --dry-run
 ```
 
@@ -40,7 +48,7 @@ bash scripts/run_timing_reference_smoke.sh \
 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
 src/bonito/.venv/bin/python -m holypoly.datasets.prepare_timing_reference \
   --config configs/local.yaml \
-  --manifest "metadata/<dataset>/manifest.tsv" \
+  --manifest "metadata/<dataset>/length/manifest.tsv" \
   --bam "dorado_calls/<sample>/dorado_basecalls.bam" \
   --output-dir "metadata/<dataset>-timing"
 ```
@@ -56,10 +64,10 @@ src/bonito/.venv/bin/python -m holypoly.datasets.prepare_timing_reference \
 USE_TIMING_REFERENCE=1 \
 TIMING_REFERENCE_MANIFEST="metadata/<dataset>-timing/timing_reference.tsv" \
 GPU_ID=0 EPOCHS=5 INITIALIZE_FROM="" \
-EXPERIMENT_ID="v4-reference-status-joint-timing-$(date +%Y%m%d-%H%M%S)" \
-bash scripts/run_reference_joint.sh \
-  "metadata/<dataset>/manifest.tsv" \
-  "metadata/<dataset>-reference-head/sequence_manifest.tsv"
+EXPERIMENT_ID="reference-status-joint-timing-$(date +%Y%m%d-%H%M%S)" \
+bash scripts/run_joint_training.sh \
+  "metadata/<dataset>/length/manifest.tsv" \
+  "metadata/<dataset>/sequence/sequence_manifest.tsv"
 ```
 
 建议先在该命令末尾加 `--dry-run`，查看覆盖率和训练规模。脚本自动将同一参照表

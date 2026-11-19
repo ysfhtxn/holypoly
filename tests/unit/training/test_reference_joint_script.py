@@ -16,8 +16,14 @@ def pipeline(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     project = tmp_path / "project"
     script = project / "scripts/run_reference_joint.sh"
     script.parent.mkdir(parents=True)
-    source = Path(__file__).resolve().parents[3] / "scripts/run_reference_joint.sh"
-    shutil.copyfile(source, script)
+    sources = Path(__file__).resolve().parents[3] / "scripts"
+    for name in (
+        script.name,
+        "run_joint_training.sh",
+        "run_strict_poly_candidate_tcn.sh",
+        "run_head_free_platform_qc_tcn.sh",
+    ):
+        shutil.copyfile(sources / name, script.parent / name)
     work = tmp_path / "work"
     result = work / "results/training_evaluation/existing"
     result.mkdir(parents=True)
@@ -71,6 +77,7 @@ def pipeline(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         python.symlink_to(spy)
     ignored = {
         "RESUME",
+        "RESUME_FROM",
         "EXPERIMENT_ID",
         "INITIALIZE_FROM",
         "GPU_ID",
@@ -80,6 +87,12 @@ def pipeline(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         "EVAL_BATCH_SIZE",
         "USE_TIMING_REFERENCE",
         "TIMING_REFERENCE_MANIFEST",
+        "HEAD_TYPE",
+        "TCN_LENGTH_SUM_SCALE",
+        "TCN_LENGTH_FEATURES",
+        "FROZEN_SEQUENCE_MONITOR",
+        "PROFILE_BATCHES",
+        "ALLOW_LEARNING_RATE_CHANGE",
     }
     environment = {key: val for key, val in os.environ.items() if key not in ignored}
     environment.update(SYNTHETIC_WORK_ROOT=str(work), EXPERIMENT_ID="existing")
@@ -109,6 +122,100 @@ def calls(work: Path) -> list[list[str]]:
         if path.exists()
         else []
     )
+
+
+def test_performance_options_reach_training(pipeline) -> None:
+    """Expose bounded profiling and the frozen monitoring compatibility switch."""
+    _, work, environment = pipeline
+    environment.update(
+        PROFILE_BATCHES="50",
+        FROZEN_SEQUENCE_MONITOR="baseline",
+        TCN_LENGTH_SUM_SCALE="0.002",
+        TCN_LENGTH_FEATURES="sum",
+    )
+    completed = run_script(pipeline, "--dry-run")
+    assert completed.returncode == 0, completed.stderr
+    arguments = calls(work)[0]
+    assert arguments[arguments.index("--profile-batches") + 1] == "50"
+    assert arguments[arguments.index("--frozen-sequence-monitor") + 1] == "baseline"
+    assert arguments[arguments.index("--tcn-length-sum-scale") + 1] == "0.002"
+    assert arguments[arguments.index("--tcn-length-features") + 1] == "sum"
+
+
+@pytest.mark.parametrize("setting", [None, "1", "0", "invalid"])
+def test_learning_rate_change_defaults_to_allowed(pipeline, setting) -> None:
+    """Both preflight and training receive the same explicit resume policy."""
+    _, work, environment = pipeline
+    environment.update(
+        RESUME="1", HEAD_LEARNING_RATE="0.0003", ENCODER_LEARNING_RATE="0.000003"
+    )
+    if setting is not None:
+        environment["ALLOW_LEARNING_RATE_CHANGE"] = setting
+    result = run_script(pipeline)
+    if setting == "invalid":
+        assert result.returncode == 2
+        assert not calls(work)
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    training = [
+        row
+        for row in calls(work)
+        if row[:2] == ["-m", "holypoly.training.joint_command"]
+    ]
+    assert len(training) == 2
+    for arguments in training:
+        assert (
+            "--no-allow-learning-rate-change"
+            if setting == "0"
+            else "--allow-learning-rate-change"
+        ) in arguments
+        assert arguments[arguments.index("--head-learning-rate") + 1] == "0.0003"
+        assert arguments[arguments.index("--encoder-learning-rate") + 1] == "0.000003"
+
+
+def test_historical_branch_option_reaches_preflight(pipeline) -> None:
+    _, work, environment = pipeline
+    environment.update(RESUME="0", RESUME_FROM="models/parent/heads.epoch_0005.pt")
+    completed = run_script(pipeline, "--dry-run")
+    assert completed.returncode == 0, completed.stderr
+    arguments = calls(work)[0]
+    assert arguments[arguments.index("--resume-from") + 1] == environment["RESUME_FROM"]
+    assert "--resume" not in arguments
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["run_strict_poly_candidate_tcn.sh", "run_head_free_platform_qc_tcn.sh"],
+)
+def test_qc_compatibility_scripts_reject_inherited_branch(pipeline, name) -> None:
+    """An old checkpoint in the environment cannot initialize a fresh QC run."""
+    script, work, environment = pipeline
+    environment.update(GPU_ID="0", RESUME_FROM="models/parent/heads.epoch_0005.pt")
+    completed = subprocess.run(
+        ["bash", str(script.with_name(name)), "metadata/qc", "--dry-run"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert completed.returncode == 2
+    assert "fresh experiment" in completed.stderr
+    assert not calls(work)
+
+
+@pytest.mark.parametrize("conflict", ["resume", "initialize", "missing-id"])
+def test_branch_conflicts_fail_before_python(pipeline, conflict) -> None:
+    _, work, environment = pipeline
+    environment["RESUME_FROM"] = "models/parent/heads.epoch_0005.pt"
+    if conflict == "resume":
+        environment["RESUME"] = "1"
+    elif conflict == "initialize":
+        environment["INITIALIZE_FROM"] = "models/parent/heads.pt"
+    else:
+        environment.pop("EXPERIMENT_ID")
+    assert run_script(pipeline).returncode == 2
+    assert not calls(work)
 
 
 @pytest.mark.parametrize("use_environment", [False, True])
@@ -299,3 +406,15 @@ def test_invalid_timing_configuration_stops_before_training(
         environment["TIMING_REFERENCE_MANIFEST"] = "unused.tsv"
     assert run_script(pipeline).returncode != 0
     assert not calls(work)
+
+
+@pytest.mark.parametrize("head_type", ["legacy", "tcn"])
+def test_head_type_reaches_training_preflight(pipeline, head_type: str) -> None:
+    """Pass the selected architecture without launching training in dry-run mode."""
+    _, work, environment = pipeline
+    environment["HEAD_TYPE"] = head_type
+    result = run_script(pipeline, "--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = calls(work)
+    assert len(recorded) == 1
+    assert recorded[0][recorded[0].index("--head-type") + 1] == head_type

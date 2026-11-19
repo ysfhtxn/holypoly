@@ -8,8 +8,19 @@ from typing import Any, Self, cast
 
 from torch import Tensor, nn
 
-from holypoly.models.length_head_config import validate_length_head_mode
-from holypoly.models.poly_heads import BonitoMultiTaskOutput, BonitoV5MultiTaskModel
+from holypoly.models.length_head_config import (
+    DEFAULT_TCN_LENGTH_FEATURES,
+    DEFAULT_TCN_LENGTH_SUM_SCALE,
+    validate_head_type,
+    validate_length_head_mode,
+    validate_tcn_length_features,
+    validate_tcn_length_sum_scale,
+)
+from holypoly.models.poly_heads import (
+    BonitoMultiTaskOutput,
+    BonitoV5MultiTaskModel,
+    PolyAuxiliaryOutput,
+)
 
 
 class HolypolyModel(nn.Module):
@@ -25,6 +36,9 @@ class HolypolyModel(nn.Module):
         freeze_basecalling_head: bool = True,
         length_head_mode: str = "mean",
         use_timing_reference: bool = False,
+        head_type: str = "legacy",
+        tcn_length_sum_scale: float = DEFAULT_TCN_LENGTH_SUM_SCALE,
+        tcn_length_features: str = DEFAULT_TCN_LENGTH_FEATURES,
     ) -> None:
         super().__init__()
         self.head_config = {
@@ -32,6 +46,14 @@ class HolypolyModel(nn.Module):
             "hidden_features": hidden_features,
             "dropout": dropout,
         }
+        if validate_head_type(head_type) != "legacy":
+            self.head_config["head_type"] = head_type
+            self.head_config["tcn_length_sum_scale"] = validate_tcn_length_sum_scale(
+                tcn_length_sum_scale
+            )
+            self.head_config["tcn_length_features"] = validate_tcn_length_features(
+                tcn_length_features
+            )
         if use_timing_reference:
             self.head_config["use_timing_reference"] = True
         self.multitask = BonitoV5MultiTaskModel(
@@ -40,6 +62,9 @@ class HolypolyModel(nn.Module):
             dropout=dropout,
             length_head_mode=length_head_mode,
             use_timing_reference=use_timing_reference,
+            head_type=head_type,
+            tcn_length_sum_scale=tcn_length_sum_scale,
+            tcn_length_features=tcn_length_features,
         )
         self.freeze_encoder = freeze_encoder
         self.freeze_basecalling_head = freeze_basecalling_head
@@ -76,6 +101,19 @@ class HolypolyModel(nn.Module):
                 ),
             )
         return cast(BonitoMultiTaskOutput, self.multitask(signal, raw_padding_mask))
+
+    def forward_poly(
+        self,
+        signal: Tensor,
+        raw_padding_mask: Tensor | None = None,
+        *,
+        timing_reference: Tensor | None = None,
+        measure: Any = None,
+    ) -> PolyAuxiliaryOutput:
+        """Return only auxiliary predictions; keep the full forward unchanged."""
+        return self.multitask.forward_poly(
+            signal, raw_padding_mask, timing_reference=timing_reference, measure=measure
+        )
 
     def train(self, mode: bool = True) -> Self:
         """Train Poly heads while keeping all frozen Bonito modules in eval mode."""
@@ -124,7 +162,17 @@ def head_config_from_checkpoint(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Restore explicit head architecture, defaulting legacy checkpoints to mean."""
     if "head_config" in payload:
         config = dict(payload["head_config"])
+        validate_head_type(config.get("head_type", "legacy"))
         validate_length_head_mode(config["length_head_mode"])
+        if config.get("head_type") == "tcn":
+            # Old TCN checkpoints used the unscaled sum. Do not reinterpret them
+            # using the smaller default introduced for new training runs.
+            config["tcn_length_sum_scale"] = validate_tcn_length_sum_scale(
+                config.get("tcn_length_sum_scale", 1.0)
+            )
+            config["tcn_length_features"] = validate_tcn_length_features(
+                config.get("tcn_length_features", "sum")
+            )
         return config
     state = payload["model_state_dict"]
     return {

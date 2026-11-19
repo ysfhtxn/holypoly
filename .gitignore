@@ -8,8 +8,8 @@ __pycache__/
 configs/local.yaml
 /AGENTS.md
 
-# Local diagnostic experiments and outputs.
-/diagnostics*/
+# Local diagnostic code, real-read audit details, results and caches.
+/diagnostics/
 
 *.pod5
 *.fast5

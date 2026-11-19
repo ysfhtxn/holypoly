@@ -136,6 +136,8 @@ def test_opt_in_joint_preflight_uses_no_signal_weights_or_gpu(
         str(work / args.output_dir / "sequence_manifest.tsv"),
         "--model-dir",
         str(model_dir),
+        "--chunk-size-samples",
+        "252",
         "--run-id",
         "synthetic-timing-joint",
         "--dry-run",
@@ -160,3 +162,62 @@ def test_opt_in_joint_preflight_uses_no_signal_weights_or_gpu(
                 [*arguments, "--use-timing-reference"]
             )
         )
+
+
+@pytest.mark.parametrize("trailing_samples", [0, 1, 2, 3, 4, 5, -1, 6])
+def test_timing_uses_same_fractional_block_policy_as_length_and_sequence(
+    tmp_path: Path, trailing_samples: int
+) -> None:
+    args, records, data, work, manifest = sequence_setup(tmp_path)
+    bam = data / "fractional.bam"
+    with pysam.AlignmentFile(str(bam), "wb", header=records[0].header) as stream:
+        for record in records:
+            record.query_sequence = "ACGT" * 50
+            record.query_qualities = array("B", [40] * 200)
+            record.set_tag("ns", int(record.get_tag("ns")) - trailing_samples)
+            stream.write(record)
+    timing_args = prepare_timing_reference.build_parser().parse_args(
+        [
+            "--config",
+            str(args.config),
+            "--manifest",
+            str(manifest),
+            "--bam",
+            str(bam),
+            "--output-dir",
+            "metadata/fractional",
+            "--scan-bam",
+        ]
+    )
+    result = prepare_timing_reference.run(timing_args)
+    expected = "ok" if 0 <= trailing_samples < 6 else "raw_signal_length_mismatch"
+    assert result["reference_status_counts"] == {expected: 3}
+    assert (work / "metadata/fractional/timing_reference.tsv").is_file()
+
+
+def test_bounded_timing_scan_keeps_unseen_rows_as_missing(tmp_path: Path) -> None:
+    args, records, data, work, manifest = sequence_setup(tmp_path)
+    timing_args = prepare_timing_reference.build_parser().parse_args(
+        [
+            "--config",
+            str(args.config),
+            "--manifest",
+            str(manifest),
+            "--bam",
+            str(data / "synthetic.bam"),
+            "--output-dir",
+            "metadata/bounded",
+            "--scan-bam",
+            "--max-records",
+            "1",
+        ]
+    )
+    result = prepare_timing_reference.run(timing_args)
+    assert result["records_scanned"] == 1
+    assert result["reference_status_counts"]["read_not_found"] == 2
+    mapping = load_timing_references(
+        work / "metadata/bounded/timing_reference.tsv",
+        load_training_manifest(manifest),
+        source_manifest=manifest,
+    )
+    assert len(mapping) == len(records)

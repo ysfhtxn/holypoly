@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import pysam
 
 from holypoly.core.config import load_config
 from holypoly.datasets.prepare_sequence import sha256
+from holypoly.datasets.signal_metadata import signal_lengths_agree
 from holypoly.inference.timing_reference import (
     TIMING_REFERENCE_SCHEMA,
     TimingWindowConfig,
@@ -30,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Default to a read-only size report; BAM records need explicit --scan-bam."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--work-root", type=Path)
+    parser.add_argument("--max-records", type=int, default=0, help="0 scans all")
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--bam", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -50,7 +55,11 @@ def _write_table(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Scan only when explicitly requested, preserving missing and failed evidence."""
-    config = load_config(args.config)
+    config = load_config(
+        args.config, cli_data_root=args.data_root, cli_work_root=args.work_root
+    )
+    if args.max_records < 0:
+        raise ValueError("max-records must be nonnegative")
     if config.paths.data_root is None or config.paths.work_root is None:
         raise ValueError("configure data_root and work_root")
     data, work = config.paths.data_root.resolve(), config.paths.work_root.resolve()
@@ -86,6 +95,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "reads": len(records),
         "window_config": asdict(TimingWindowConfig()),
         "scan_bam": args.scan_bam,
+        "max_records": args.max_records,
         "command": sys.argv,
         "started_utc": datetime.now(UTC).isoformat(),
         "resources": {
@@ -110,7 +120,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     windows: list[dict[str, Any]] = []
     scanned, started, last_progress = 0, time.monotonic(), time.monotonic()
     with pysam.AlignmentFile(str(bam), "rb", check_sq=False) as source:
-        for record in source.fetch(until_eof=True):
+        for record in islice(source.fetch(until_eof=True), args.max_records or None):
             scanned += 1
             if time.monotonic() - last_progress >= 15:
                 print(
@@ -132,7 +142,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             if (
                 record.has_tag("ns")
-                and int(record.get_tag("ns")) != wanted[read_id].raw_signal_length
+                and record.has_tag("mv")
+                and not signal_lengths_agree(
+                    wanted[read_id].raw_signal_length,
+                    int(record.get_tag("ns")),
+                    int(record.get_tag("mv")[0]) if record.get_tag("mv") else 0,
+                )
             ):
                 values = missing_timing_reference("raw_signal_length_mismatch")
                 details: list[dict[str, Any]] = []

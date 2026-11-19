@@ -482,6 +482,8 @@ def test_builder_roundtrip_through_training_dataset(
             "heads.fa",
             "--pod5-dir",
             ".",
+            "--structure",
+            "head-poly-flank",
             "--chunk-size-samples",
             "960",
             "--min-flank-reads",
@@ -499,7 +501,7 @@ def test_builder_roundtrip_through_training_dataset(
         "3/3 Dorado boundaries / POD5 metadata",
     ):
         assert stage in progress_output.err
-    output = work_root / "metadata/poly-dataset-v3"
+    output = work_root / "metadata/poly-dataset"
     records_loaded = load_training_manifest(output / "manifest.tsv")
     expected_count = (
         (20 if with_flank else 16)

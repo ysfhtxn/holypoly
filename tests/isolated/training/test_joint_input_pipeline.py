@@ -240,7 +240,9 @@ def test_prefetch_preserves_joint_updates_and_sequence_loader_restart(
             assert torch.equal(value, optimized[2]["state"][key][name])
 
 
-@pytest.mark.parametrize("option", ["--prefetch-batches", "--pod5-reader-cache-size"])
+@pytest.mark.parametrize(
+    "option", ["--prefetch-batches", "--pod5-reader-cache-size", "--profile-batches"]
+)
 def test_negative_input_pipeline_settings_fail_before_data_access(option: str) -> None:
     args = joint_command.build_parser().parse_args(
         ["--manifest", "unused", "--sequence-manifest", "unused", option, "-1"]

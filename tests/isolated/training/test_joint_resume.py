@@ -1,4 +1,4 @@
-"""Synthetic metadata and checkpoint tests for length batch changes on resume."""
+"""Synthetic metadata/checkpoint tests for batch and learning-rate resumes."""
 
 from __future__ import annotations
 
@@ -70,6 +70,41 @@ def test_only_length_batch_change_is_allowed(
     assert saved == _config()
     with pytest.raises(ValueError, match="joint training configuration"):
         validate_joint_config(None, requested, allow_batch_size_change=True)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"head_learning_rate": 3e-4},
+        {"encoder_learning_rate": 3e-6},
+        {"head_learning_rate": 3e-4, "encoder_learning_rate": 3e-6},
+    ],
+)
+def test_rate_override_only_relaxes_learning_rates(updates: dict[str, float]) -> None:
+    """Explicit overrides preserve immutable settings and the strict opt-out."""
+    saved = _config()
+    requested = {**saved, **updates}
+    validate_joint_config(saved, requested, allow_learning_rate_change=True)
+    with pytest.raises(ValueError, match="learning_rate"):
+        validate_joint_config(saved, requested)
+    for key, value in (
+        ("sequence_batch_size", 2),
+        ("lambda_basecall", 0.2),
+        ("length_manifest_sha256", "c" * 64),
+    ):
+        with pytest.raises(ValueError, match=key):
+            validate_joint_config(
+                saved, {**requested, key: value}, allow_learning_rate_change=True
+            )
+
+
+@pytest.mark.parametrize("rate", [0, -1, float("nan"), float("inf"), True, None])
+@pytest.mark.parametrize("key", ["head_learning_rate", "encoder_learning_rate"])
+def test_rate_override_rejects_invalid_rates(key: str, rate: Any) -> None:
+    with pytest.raises(ValueError, match=key):
+        validate_joint_config(
+            _config(), {**_config(), key: rate}, allow_learning_rate_change=True
+        )
 
 
 def _history_row(epoch: int, split: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -156,6 +191,64 @@ def test_mixed_batch_history_supports_repeated_and_interrupted_resumes(
     assert log.read_bytes().startswith(before)
 
 
+def test_rate_history_supports_repeated_and_interrupted_resumes(tmp_path: Path) -> None:
+    """Old-rate epochs and a stale summary remain valid on subsequent resumes."""
+    log, result, payload = _resume_files(tmp_path)
+    requested = {**_config(), "head_learning_rate": 3e-4, "encoder_learning_rate": 3e-6}
+    arguments = dict(
+        log=log,
+        result_dir=result,
+        joint_config=requested,
+        target_epochs=3,
+        recorded_utc="synthetic",
+        allow_batch_size_change=False,
+    )
+    with pytest.raises(ValueError, match="learning_rate"):
+        joint_command._validate_resume_metadata(
+            payload, **arguments, allow_learning_rate_change=False
+        )
+    assert joint_command._validate_resume_metadata(payload, **arguments) == []
+    changes = joint_command._resume_learning_rate_changes(
+        payload, requested, "synthetic"
+    )
+    assert changes == [
+        {
+            "after_epoch": 1,
+            "global_step": 3,
+            "recorded_utc": "synthetic",
+            "from_head_learning_rate": 0.001,
+            "to_head_learning_rate": 3e-4,
+            "from_encoder_learning_rate": 1e-5,
+            "to_encoder_learning_rate": 3e-6,
+        }
+    ]
+    assert "learning_rate_changes" not in payload
+    with log.open("a") as stream:
+        for split in ("train", "validation"):
+            stream.write(json.dumps(_history_row(2, split, requested)) + "\n")
+    payload.update(
+        epoch=2, global_step=6, joint_config=requested, learning_rate_changes=changes
+    )
+    # Strict matching concerns the latest configuration, not older epochs.
+    assert (
+        joint_command._validate_resume_metadata(
+            payload, **arguments, allow_learning_rate_change=False
+        )
+        == []
+    )
+    assert (
+        joint_command._resume_learning_rate_changes(payload, requested, "later")
+        == changes
+    )
+    again = joint_command._resume_learning_rate_changes(
+        payload, {**requested, "head_learning_rate": 1e-4}, "later"
+    )
+    assert again[:-1] == changes
+    assert again[-1]["from_head_learning_rate"] == 3e-4
+    assert again[-1]["to_head_learning_rate"] == 1e-4
+    assert again[-1]["after_epoch"] == 2
+
+
 @pytest.mark.parametrize(
     "corruption", ["step", "missing_epoch", "pair", "immutable", "summary", "baseline"]
 )
@@ -192,8 +285,21 @@ def test_batch_override_still_rejects_inconsistent_run_history(
         )
 
 
+@pytest.mark.parametrize(
+    "rate_updates",
+    [
+        {},
+        {"head_learning_rate": 3e-4},
+        {"encoder_learning_rate": 3e-6},
+        {"head_learning_rate": 3e-4, "encoder_learning_rate": 3e-6},
+    ],
+)
+@pytest.mark.parametrize("unfreeze_last_layers", [0, 1])
 def test_checkpoint_restores_optimizer_and_records_batch_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rate_updates: dict[str, float],
+    unfreeze_last_layers: int,
 ) -> None:
     """Real serialization restores synthetic Adam state and preserves old snapshots."""
     for name, function in (
@@ -205,7 +311,10 @@ def test_checkpoint_restores_optimizer_and_records_batch_change(
         monkeypatch.setattr(torch.cuda, name, function)
     monkeypatch.setattr(engine, "require_single_cuda_device", lambda _: None)
     model = JointHolypolyModel(
-        joint_basecaller(), hidden_features=6, length_head_mode="sum"
+        joint_basecaller(),
+        hidden_features=6,
+        length_head_mode="sum",
+        unfreeze_last_layers=unfreeze_last_layers,
     )
     optimizer = create_joint_optimizer(
         model, head_learning_rate=0.001, encoder_learning_rate=1e-5, weight_decay=0
@@ -233,7 +342,10 @@ def test_checkpoint_restores_optimizer_and_records_batch_change(
     )
     previous = epoch_checkpoint_path(path, 1).read_bytes()
     restored_model = JointHolypolyModel(
-        joint_basecaller(), hidden_features=6, length_head_mode="sum"
+        joint_basecaller(),
+        hidden_features=6,
+        length_head_mode="sum",
+        unfreeze_last_layers=unfreeze_last_layers,
     )
     restored_optimizer = create_joint_optimizer(
         restored_model,
@@ -241,22 +353,32 @@ def test_checkpoint_restores_optimizer_and_records_batch_change(
         encoder_learning_rate=1e-5,
         weight_decay=0,
     )
+    requested = {**_config(64), **rate_updates}
     restore_args = dict(
         model=restored_model,
         optimizer=restored_optimizer,
         device=torch.device("cpu"),
         loss_weights=weights,
-        joint_config=_config(64),
+        joint_config=requested,
     )
     with pytest.raises(ValueError, match="length_batch_size"):
         load_checkpoint(path, **restore_args)
-    restored = load_checkpoint(path, **restore_args, allow_batch_size_change=True)
+    if rate_updates:
+        with pytest.raises(ValueError, match="learning_rate"):
+            load_checkpoint(path, **restore_args, allow_batch_size_change=True)
+    restored = load_checkpoint(
+        path,
+        **restore_args,
+        allow_batch_size_change=True,
+        allow_learning_rate_change=True,
+    )
     assert (restored.epoch, restored.global_step) == (1, 3)
     with pytest.raises(ValueError, match="loss configuration differs"):
         load_checkpoint(
             path,
             **{**restore_args, "loss_weights": replace(weights, lambda_status=2)},
             allow_batch_size_change=True,
+            allow_learning_rate_change=True,
         )
     with pytest.raises(ValueError, match="data order seed differs"):
         load_checkpoint(
@@ -264,19 +386,27 @@ def test_checkpoint_restores_optimizer_and_records_batch_change(
             **restore_args,
             data_order_seed=123,
             allow_batch_size_change=True,
+            allow_learning_rate_change=True,
         )
     for key, value in model.state_dict().items():
         assert torch.equal(value, restored_model.state_dict()[key])
-    assert (
-        restored_optimizer.state_dict()["param_groups"]
-        == optimizer_before["param_groups"]
-    )
+    expected_groups = deepcopy(optimizer_before["param_groups"])
+    expected_groups[0]["lr"] = requested["head_learning_rate"]
+    expected_groups[1]["lr"] = requested["encoder_learning_rate"]
+    assert restored_optimizer.state_dict()["param_groups"] == expected_groups
     for key, values in optimizer_before["state"].items():
         for name, value in values.items():
             assert torch.equal(
                 value, restored_optimizer.state_dict()["state"][key][name]
             )
     changes = ({"after_epoch": 1, "from_batch_size": 8, "to_batch_size": 64},)
+    rate_changes = tuple(
+        joint_command._resume_learning_rate_changes(
+            {"epoch": 1, "global_step": 3, "joint_config": _config()},
+            requested,
+            "synthetic",
+        )
+    )
     save_checkpoint(
         path,
         model=restored_model,
@@ -285,8 +415,10 @@ def test_checkpoint_restores_optimizer_and_records_batch_change(
         global_step=4,
         context=replace(
             context,
-            joint_config=_config(64),
+            joint_config=requested,
             length_batch_size_changes=changes,
+            learning_rate_changes=rate_changes,
+            branch_origin={"checkpoint": "synthetic-parent", "epoch": 1},
             input_pipeline={"prefetch_batches": 2, "pod5_reader_cache_size": 8},
         ),
         archive_epoch=True,
@@ -294,6 +426,8 @@ def test_checkpoint_restores_optimizer_and_records_batch_change(
     payload = torch.load(path, map_location="cpu", weights_only=False)
     assert payload["joint_config"]["length_batch_size"] == 64
     assert payload["length_batch_size_changes"] == list(changes)
+    assert payload.get("learning_rate_changes", []) == list(rate_changes)
+    assert payload["branch_origin"] == {"checkpoint": "synthetic-parent", "epoch": 1}
     assert payload["input_pipeline"] == {
         "prefetch_batches": 2,
         "pod5_reader_cache_size": 8,
@@ -364,10 +498,22 @@ def test_resume_dry_run_checks_checkpoint_without_signals_or_gpu(
     assert resumed_summary["length_batch_size_changes"][0]["from_batch_size"] == 8
     assert resumed_summary["input_pipeline"]["prefetch_batches"] == 2
     assert resumed_summary["input_pipeline"]["pod5_reader_cache_size"] == 8
+    assert resumed_summary["input_pipeline"]["frozen_sequence_monitor"] == "per-step"
+    assert resume_args.allow_learning_rate_change is True
+    resume_args.head_learning_rate = 3e-4
+    resume_args.encoder_learning_rate = 3e-6
+    changed = joint_command.run(resume_args)
+    assert changed["joint_config"]["head_learning_rate"] == 3e-4
+    assert changed["learning_rate_changes"][0]["from_encoder_learning_rate"] == 1e-5
+    assert changed["learning_rate_changes"][0]["to_encoder_learning_rate"] == 3e-6
+    resume_args.allow_learning_rate_change = False
+    with pytest.raises(ValueError, match="learning_rate"):
+        joint_command.run(resume_args)
+    resume_args.allow_learning_rate_change = True
     resume_args.prefetch_batches = 0
     resume_args.pod5_reader_cache_size = 0
     synchronous = joint_command.run(resume_args)
-    assert synchronous["joint_config"] == resumed_summary["joint_config"]
+    assert synchronous["joint_config"] == changed["joint_config"]
     assert synchronous["input_pipeline"]["prefetch_batches"] == 0
     strict_args = joint_command.build_parser().parse_args(
         [*arguments, "--resume", "--batch-size", "64", "--no-allow-batch-size-change"]
@@ -376,3 +522,53 @@ def test_resume_dry_run_checks_checkpoint_without_signals_or_gpu(
         joint_command.run(strict_args)
     after = {path: path.read_bytes() for path in work.rglob("*") if path.is_file()}
     assert after == before
+    archive = checkpoint.with_name("heads.epoch_0001.pt")
+    archive.write_bytes(checkpoint.read_bytes())
+    branch_args = joint_command.build_parser().parse_args(
+        [
+            *arguments,
+            "--run-id",
+            "synthetic-branch",
+            "--resume-from",
+            str(archive),
+            "--head-learning-rate",
+            "0.0003",
+            "--encoder-learning-rate",
+            "0.000003",
+        ]
+    )
+    before_branch = {
+        path: path.read_bytes() for path in work.rglob("*") if path.is_file()
+    }
+    branched = joint_command.run(branch_args)
+    assert branched["branch_origin"]["epoch"] == 1
+    assert branched["branch_origin"]["parent_run_id"] == "synthetic-resume"
+    assert branched["learning_rate_changes"][0]["to_head_learning_rate"] == 3e-4
+    assert {
+        path: path.read_bytes() for path in work.rglob("*") if path.is_file()
+    } == before_branch
+    for flag in ("--resume", "--initialize-from"):
+        invalid = joint_command.build_parser().parse_args(
+            [
+                *arguments,
+                "--resume-from",
+                str(archive),
+                flag,
+                *([str(archive)] if flag == "--initialize-from" else []),
+            ]
+        )
+        with pytest.raises(ValueError, match="resume/initialization"):
+            joint_command.run(invalid)
+    torch.save(
+        {
+            "epoch": 1,
+            "global_step": 3,
+            "joint_config": config,
+            "input_pipeline": {"frozen_sequence_monitor": "baseline"},
+        },
+        checkpoint,
+    )
+    assert (
+        joint_command.run(resume_args)["input_pipeline"]["frozen_sequence_monitor"]
+        == "baseline"
+    )

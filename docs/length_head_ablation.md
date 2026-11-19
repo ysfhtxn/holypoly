@@ -23,17 +23,17 @@
 仍运行冻结 encoder、原 basecalling head 和定位 head，因此不会明显节省整体计算。
 
 定位 head、原 CRF、训练 loss、长度标签和冻结策略保持原样。
-v4 的定位和状态没有监督；比较时使用 `regression_length_nt`，不使用状态门控长度。
+head–Poly 数据的定位和状态没有监督；比较时使用 `regression_length_nt`，不使用状态门控长度。
 新模式的 MLP 容量与旧线性回归器不同，因此提升只能先支持“新输入及回归器组合有用”，
 不能单独证明平均池化是唯一原因；严格分离容量影响还需后续容量匹配对照。
 
 ## 运行
 
-用外部 work root 下的现有 v4 manifest，例如：
+用外部 work root 下的现有 head–Poly manifest，例如：
 
 ```bash
 bash scripts/run_length_head_ablation.sh \
-  metadata/<existing-v4-dataset>/manifest.tsv
+  metadata/<existing-dataset>/length/manifest.tsv
 ```
 
 脚本固定物理 GPU 0（模型内部 `cuda:0`），按三种模式顺序执行训练、测试、画图。
@@ -64,7 +64,7 @@ bash scripts/run_length_head_ablation.sh \
 
 ```bash
 SUBSET_PER_GROUP=200 bash scripts/run_length_head_ablation.sh \
-  metadata/<existing-v4-dataset>/manifest.tsv
+  metadata/<existing-dataset>/length/manifest.tsv
 ```
 
 脚本只从已有 manifest 抽样，每个标称长度/type 200 条，保留原 split 和全部标签字段。
@@ -84,7 +84,7 @@ SUBSET_PER_GROUP=200 bash scripts/run_length_head_ablation.sh \
 ```bash
 PYTHONPATH=src .venv/bin/python -m holypoly.datasets.subset_manifest \
   --config configs/local.yaml \
-  --manifest metadata/<existing-v4-dataset>/manifest.tsv \
+  --manifest metadata/<existing-dataset>/length/manifest.tsv \
   --output-dir metadata/<new-small-dataset> --per-group 200 --seed 20260923 \
   --dry-run
 ```
@@ -109,7 +109,7 @@ bash scripts/legacy/resume_length_head_ablation.sh <source-experiment-id>
 ```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/holypoly train \
   --config configs/local.yaml \
-  --manifest metadata/<existing-v4-dataset>/manifest.tsv \
+  --manifest metadata/<existing-dataset>/length/manifest.tsv \
   --length-head-mode mean_duration \
   --checkpoint models/<new-run>/heads.pt \
   --loss-log logs/<new-run>/train.jsonl \

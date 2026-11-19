@@ -1,13 +1,15 @@
 # 文档导航
 
-常规实验沿 `scripts/run_reference_joint.sh` 展开。首次使用从
+常规实验沿 `scripts/run_joint_training.sh` 展开。首次使用从
 [默认流程](default_workflow.md)开始，重复操作使用[命令速查](common_commands.md)。
 
 ## 数据、训练与结果
 
 | 阶段 | 文档 |
 | --- | --- |
-| v4 长度/状态 manifest | [prepare_dataset_v4.md](prepare_dataset_v4.md) |
+| 统一制作长度、序列与可选时间参照 | [prepare_dataset.md](prepare_dataset.md) |
+| 新方法：严格信号候选筛选与配套训练表 | [strict_poly_candidate_dataset.md](strict_poly_candidate_dataset.md) |
+| 独立新方法：完整 head-free 输入、平台质控、元数据 0 nt | [head_free_platform_qc_dataset.md](head_free_platform_qc_dataset.md) |
 | 配套 reference-head、联合训练及恢复 | [reference_joint_training.md](reference_joint_training.md) |
 | checkpoint 保存与历史兼容 | [checkpoints.md](checkpoints.md) |
 | validation/test 与绘图 | [evaluate_model.md](evaluate_model.md) |

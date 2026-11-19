@@ -239,7 +239,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "Construct nominal weak labels, not per-read true lengths; zero_nt is "
             "a separate negative group. Same acquisition as development data; "
             "read-disjointness does not establish cross-run generalization. "
-            "Source v4 head/raw-edge eligibility and BAM-order quota selection "
+            "Source head/raw-edge eligibility and BAM-order quota selection "
             "remain selection biases. No model/candidate predictions selected reads. "
             "All complete raw read records are copied; biological Poly completeness "
             "and Poly endpoints remain unverified. Final set must not be used to tune."

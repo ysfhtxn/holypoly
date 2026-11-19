@@ -1,15 +1,15 @@
 # 参考 head 序列监督与联合训练
 
 2026-10-28 起，这是新数据与新常规训练的默认流程，入口见
-[当前默认流程](default_workflow.md)。保留 v4 原 manifest、长度标签、原网络结构和旧实验。
+[当前默认流程](default_workflow.md)。保留原 manifest、长度标签、原网络结构和旧实验。
 head 序列 manifest 与长度 manifest 配套制作；历史冻结入口用于旧实验和对照。
 
 ## 标签与训练方式
 
-序列监督来自已有参考 FASTA 中的 **head 内部序列**。FASTA 仍按 v4 的约定解释为
+序列监督来自已有参考 FASTA 中的 **head 内部序列**。FASTA 仍按 head–Poly 的约定解释为
 head；不把标称长度复制成 `AAAA…`，也不把 Dorado 的整条 basecall 当真值。
 
-1. 仅使用指定 v4 manifest 的 read ID，严格继承 train/validation/test split。
+1. 仅使用指定长度 manifest 的 read ID，严格继承 train/validation/test split。
 2. 用 Dorado BAM 比对和 move table 找到 head 内部的一段信号。默认取 96 bp，
    距 head 两端至少 32 bp，优先选靠 head 末端的有效窗口。
 3. 要求连续完全匹配参考、无 indel、MAPQ ≥20、每个碱基 Q≥15；窗口不得含超过
@@ -26,12 +26,12 @@ head；不把标称长度复制成 `AAAA…`，也不把 Dorado 的整条 baseca
 每次更新分别 forward 原 Poly 候选和独立 head 片段，二者使用同一个 encoder：
 
 ```text
-joint_loss = lambda_length × Huber(predicted_length, 原 v4 长度标签)
+joint_loss = lambda_length × Huber(predicted_length, 原 长度标签)
              + lambda_status × CE(shared_status_logits, 弱状态标签)
              + lambda_basecall × Bonito 原生 CTC-CRF(head_signal, reference_head)
 ```
 
-原始 v4 manifest 是 `length_only`。联合入口默认启用 `--supervise-status`：
+原始 manifest 是 `length_only`。联合入口默认启用 `--supervise-status`：
 沿用原 manifest 的 `label_status`，记录来源为 `construct_nominal_weak_supervision`；
 0 nt 构建监督 `zero_nt`，正标称长度构建监督 `poly_present`。
 这不是逐 read 生物学真值，不按 basecaller 长度改标签，也不引入 `<5 nt` 新定义。
@@ -39,7 +39,7 @@ joint_loss = lambda_length × Huber(predicted_length, 原 v4 长度标签)
 
 Status loss 为原两个 head 的 status logits 均值上的三分类交叉熵，
 只计算一次；两个现有 status 分支均可获得梯度，无需改网络结构。
-保留 `failure` 类，但 v4 没有 failure 标签，不能由此声称学会检测失败。
+保留 `failure` 类，但当前数据没有 failure 标签，不能由此声称学会检测失败。
 联合入口目前使用普通 CE，不做类别重采样或加权；训练类别数量写入 `joint_config`，
 后续根据 validation 的负样本召回和正样本误判判断是否需要平衡。
 
@@ -78,20 +78,23 @@ length/status 权重未显式指定时取配置文件，启用状态后 location
 占比，需对相同 batch size 实测。只对新进程生效；运行中的任务保持原行为。
 若中途停止，仍只能从最后完整保存的 epoch 恢复，不保存预取队列或轮内进度。
 
-## 制作序列 manifest
+## 补配已有数据的序列 manifest
 
-在项目根目录运行。以下路径是示例：`metadata/experiment/manifest.tsv` 换成已有
-小型 v4 manifest；BAM、参考相对于 data root，其他路径相对于 work root。
+新数据通过[统一制作入口](prepare_dataset.md)一次完成。下面仅用于已有长度集补配，
+不重新划分 read；已有 sequence 目录时另选新目录。
+
+在项目根目录运行。以下路径是示例：`metadata/experiment/length/manifest.tsv` 换成已有
+小型 head–Poly manifest；BAM、参考相对于 data root，其他路径相对于 work root。
 所有输出目录必须是新目录。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 src/bonito/.venv/bin/python -m holypoly.datasets.prepare_sequence \
   --config configs/local.yaml \
-  --manifest metadata/experiment/manifest.tsv \
+  --manifest metadata/experiment/length/manifest.tsv \
   --dorado-bam dorado_calls/poly2p5per/dorado_basecalls.bam \
   --reference fixed_len_ref.fa \
-  --output-dir metadata/experiment-reference-head \
+  --output-dir metadata/experiment/sequence \
   --max-records 100000 --dry-run
 ```
 
@@ -111,21 +114,20 @@ head 筛选不会删除或改动原来的长度样本。
 ## 训练、测试与绘图
 
 ```bash
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
+GPU_ID=0 bash scripts/run_joint_training.sh --dataset-dir metadata/experiment --dry-run
 ```
 
-去掉 `--dry-run` 开始训练；默认物理 GPU 0，内部为 `cuda:0`。
+去掉 `--dry-run` 开始训练，选定的物理 GPU 在进程内为 `cuda:0`。对已有配套表也可以
+按下面的形式传入长度和序列 manifest。
 训练 batch 默认 32，`EVAL_BATCH_SIZE` 可单独控制末尾 test 推理；不设置时继承
 显式的 `BATCH_SIZE`，两者均未设置时 test batch=4，保持已有行为。
 可用环境变量覆盖：
 
 ```bash
 GPU_ID=0 EPOCHS=5 LAMBDA_BASECALL=0.1 ENCODER_LEARNING_RATE=0.00001 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv
 ```
 
 三项 loss 已默认启用；显式记录权重的命令示例为：
@@ -133,9 +135,9 @@ bash scripts/run_reference_joint.sh \
 ```bash
 STATUS_SUPERVISION=1 LAMBDA_LENGTH=1 LAMBDA_STATUS=1 LAMBDA_BASECALL=0.1 \
 GPU_ID=0 EPOCHS=5 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv
 ```
 
 脚本环境变量分别映射到 `--supervise-status`、`--lambda-length`、
@@ -178,15 +180,16 @@ length status 分支，不等同于共享状态解码，不应混作联合状态
 
 脚本支持续训并在结束后自动完成最佳模型的长度测试和绘图。设置 `RESUME=1`
 或追加 `--resume`，同时必须显式指定原 `EXPERIMENT_ID`。`EPOCHS` 是目标总轮数，
-必须大于最后保存的 epoch；除长度 batch size 和读取优化参数外，保持原训练设置：
+必须大于最后保存的 epoch；除长度 batch size、head/encoder 学习率和读取优化参数外，
+保持原训练设置：
 
 ```bash
 RESUME=1 EXPERIMENT_ID=<existing-joint-run> \
 GPU_ID=0 EPOCHS=10 BATCH_SIZE=32 \
 STATUS_SUPERVISION=1 LAMBDA_LENGTH=1 LAMBDA_STATUS=1 LAMBDA_BASECALL=0.1 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv
 ```
 
 续训不能同时指定 `INITIALIZE_FROM`；恢复原模型、optimizer、epoch 和 global step，
@@ -212,8 +215,8 @@ logs/<run>-pipeline-resume-<时间>-<PID>/pipeline.log
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src src/bonito/.venv/bin/python \
   -m holypoly.training.joint_command \
   --config configs/local.yaml \
-  --manifest metadata/experiment/manifest.tsv \
-  --sequence-manifest metadata/experiment-reference-head/sequence_manifest.tsv \
+  --manifest metadata/experiment/length/manifest.tsv \
+  --sequence-manifest metadata/experiment/sequence/sequence_manifest.tsv \
   --run-id <existing-joint-run> --epochs 10 --resume
 ```
 
@@ -223,14 +226,43 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src src/bonito/.venv/bin/python \
 三项 loss 实验续训保持 status 开启和原有权重参数；不能把旧两项 loss
 实验直接按三项 loss resume。旧两项续训显式加 `--no-supervise-status`。
 
+从历史 epoch 降低学习率继续训练时，使用 `RESUME_FROM` 创建独立分支：
+
+```bash
+RESUME=0 INITIALIZE_FROM="" \
+RESUME_FROM=models/<parent-run>/heads.epoch_0005.pt \
+EXPERIMENT_ID=<new-branch-run> EPOCHS=8 BATCH_SIZE=32 \
+HEAD_LEARNING_RATE=0.0003 ENCODER_LEARNING_RATE=0.000003 \
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv
+```
+
+其余模型、loss、seed 等参数沿用源实验。独立入口对应
+`--resume-from models/<parent-run>/heads.epoch_0005.pt --run-id <new-branch-run>`。
+不能同时使用 `--resume` 或 `--initialize-from`；源文件必须是 work root 下
+`models/<run>/heads.epoch_NNNN.pt` 的历史快照，新 run 的模型、日志和结果目录
+必须均不存在。恢复完整 optimizer、epoch、global step 和随机状态；从第 5 轮
+分支且 `EPOCHS=8` 时只训练第 6–8 轮。学习率仍默认允许调整。
+
+新分支独立复制第 1–5 轮快照、所选快照作为 latest、前五轮日志和原序列 baseline，
+不继承源实验的第 6 轮及以后。快照采用文件复制，不使用硬链接；源实验保持原样，
+历史最佳模型可在新分支中直接评估。每个快照约 0.34 GiB 时，分支准备约复制
+2 GiB，另需后续轮次和 latest 的空间；预检 JSON 的 `branch_origin.copy_bytes`
+报告实际复制量。`--dry-run` 只读验证，不复制、不创建新目录、不访问原始信号。
+来源路径、父 run、分支 epoch 和 global step 保存为 `branch_origin`，写入
+运行汇总和后续 checkpoint，普通 `--resume` 会保留该来源记录。
+创建成功后继续这个分支，用其新 ID 和 `RESUME=1`，清空 `RESUME_FROM`。
+
 续训默认允许改变长度训练的 batch size，直接设置新值即可：
 
 ```bash
 --resume --epochs 8 --batch-size 64
 ```
 
-默认只允许改变 `--batch-size`，不能改变
-`--sequence-batch-size`、学习率、loss、解冻层数、随机种子或输入数据。
+默认允许改变 `--batch-size`、`--head-learning-rate` 和
+`--encoder-learning-rate`，不能改变 `--sequence-batch-size`、loss、解冻层数、
+随机种子或输入数据。
 可用 `--no-allow-batch-size-change` 要求 batch size 也严格匹配。
 保留 `--allow-batch-size-change` 作为兼容写法，无需显式添加；新训练不受此设置影响。
 保留已有 optimizer 动量及 global step，不自动缩放学习率。
@@ -239,13 +271,33 @@ checkpoint 与运行汇总中的 `length_batch_size_changes` 记录变更发生�
 global step、原值、新值和时间。
 最佳 checkpoint 的配置以其所属 epoch 为准，可能仍是变更前的旧 epoch。
 
+调整学习率直接在原续训命令中设置新值，例如：
+
+```bash
+HEAD_LEARNING_RATE=0.0003 ENCODER_LEARNING_RATE=0.000003 RESUME=1 \
+EXPERIMENT_ID=<existing-joint-run> EPOCHS=10 \
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv
+```
+
+保留原命令中其余模型和 loss 参数。恢复 optimizer 后，按命名参数组设置本次命令
+请求的学习率，保留 Adam 动量等历史状态；省略学习率参数时使用 CLI/脚本默认值，
+不会自动沿用 checkpoint 中的值。日志、checkpoint 和运行汇总中的
+`learning_rate_changes` 记录变更前后两组学习率、最后完成的 epoch、global step
+及时间。新 epoch 的 `joint_config` 记录实际学习率，旧记录保持原样；不添加自动
+学习率调度。旧 checkpoint 无此变更字段仍可恢复。
+默认开启 `--allow-learning-rate-change`；独立入口用
+`--no-allow-learning-rate-change`，脚本用 `ALLOW_LEARNING_RATE_CHANGE=0` 恢复严格
+学习率匹配。严格匹配只检查本次请求与最新 checkpoint，允许历史中存在已记录的变化。
+
 当前每次长度更新使用一批 head 序列监督。以 28000 条长度训练样本为例，
 batch 从 8 改为 64 后，每轮更新从 3500 次降为 438 次；head batch=1 时，
 每轮序列监督样本数也相应从 3500 降为 438。该选项不自动补齐序列监督量，
 因此它不是原 batch 配置下完全等价的训练，需继续检查验证集长度和序列表现。
 
 续训可先加 `--dry-run`：读取两份 manifest、日志、运行汇总和 checkpoint 的
-CPU mmap 元数据，检查 batch 变更和历史一致性；不加载模型到 GPU、不读 POD5
+CPU mmap 元数据，检查 batch/学习率变更和历史一致性；不加载模型到 GPU、不读 POD5
 信号、不写实验文件。实际恢复时仍会检查 loss、模型结构及 optimizer 状态。
 
 ## 如何判断收益

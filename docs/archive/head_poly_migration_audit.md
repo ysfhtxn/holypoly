@@ -1,7 +1,7 @@
 # 历史 v3→v4 信号范围审计
 
 本文保留 2026-10-19 的迁移审计方法和当时结果。新数据按
-[v4 制作方法](../prepare_dataset_v4.md) 与[默认流程](../default_workflow.md)准备。
+[统一制作方法](../prepare_dataset.md) 与[默认流程](../default_workflow.md)准备。
 
 从已有 manifest 每个标称长度抽 20 条，直接读取所选 POD5 信号，比较 v3 输入与
 原始 read 外侧范围。先加 `--dry-run` 可查看读取量且不写文件。

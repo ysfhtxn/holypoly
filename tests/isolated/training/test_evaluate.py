@@ -336,13 +336,16 @@ def test_evaluation_exports_test_only_and_restores_checkpoint_hidden_size(
         "HOLYPOLY_M3_MANIFEST",
         "HOLYPOLY_M3_CHECKPOINT",
         "HOLYPOLY_BONITO_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    data_root, work_root = tmp_path / "data", tmp_path / "work"
+    for name in (
         "TORCHINDUCTOR_CACHE_DIR",
         "TRITON_CACHE_DIR",
         "TORCH_EXTENSIONS_DIR",
         "CUDA_CACHE_PATH",
     ):
-        monkeypatch.delenv(name, raising=False)
-    data_root, work_root = tmp_path / "data", tmp_path / "work"
+        monkeypatch.setenv(name, str(work_root / "cache" / name.lower()))
     data_root.mkdir()
     model_dir = work_root / "model"
     model_dir.mkdir(parents=True)

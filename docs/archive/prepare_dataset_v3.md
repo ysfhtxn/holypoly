@@ -1,7 +1,7 @@
 # 历史 v3：构建级弱监督训练集
 
 > 本文合并原 v3 制作说明，供历史实验复现使用。
-> 新数据使用 [v4 制作方法](../prepare_dataset_v4.md) 和
+> 新数据使用 [统一制作方法](../prepare_dataset.md) 和
 > [联合训练主流程](../default_workflow.md)，不沿用本文的 flank 假设。
 
 脚本：`src/holypoly/datasets/prepare.py`。在 Bonito 独立环境运行，无新增依赖，

@@ -10,7 +10,7 @@
    至少排除 train/validation；推荐同时排除历史 test。
    `holypoly.datasets.export_holdout.history_exclusions` 支持合并、SHA256 溯源和
    单个 manifest 内的跨 split 重复检查。UUID 清单只存入外部 work root。
-2. 采用现有 v4 `head-poly / raw-edge` 规则重新筛选，使用
+2. 采用现有 head–Poly `head-poly / raw-edge` 规则重新筛选，使用
    `prepare --exclude-read-ids` 在配额计算、边界检查和 POD5 元数据访问之前
    去除旧 read。不读取全量 POD5 信号。
 3. 导出器对剩余候选按长度等量抽样；每组数量为请求上限和最小可用组数量的
@@ -82,6 +82,6 @@ bash scripts/holypoly_predict_cdna.sh "$FINAL_POD5_DIR"
 
 * 原始信号完整复制不等于生物学 Poly 完整，边界与逐 read 真值仍未独立验证。
 * 来源是同一采集批次；read 不重叠不能证明跨批次泛化。
-* v4 候选规则、可对齐性及 BAM 顺序早停会产生选择偏差。
+* head–Poly 候选规则、可对齐性及 BAM 顺序早停会产生选择偏差。
 * 比较时保留所有 read 的失败状态，同时报告覆盖率和成功子集的标称长度偏差。
 * 此排除检查依赖提供的历史 manifest 清单；旧测试曾被用于调参时也应排除。

@@ -12,7 +12,7 @@ import hashlib
 import json
 import sys
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +20,7 @@ from typing import Any
 
 from holypoly.core.config import load_config
 from holypoly.datasets.prepare import bam_records, load_heads, move_bounds, write_table
+from holypoly.datasets.signal_metadata import signal_lengths_agree
 
 VERSION = "reference-head-sequence-v1"
 LABEL_SOURCE = "reference_head_exact_match"
@@ -136,9 +137,17 @@ def select_head_window(
     raise ValueError("no_unique_exact_high_quality_interior_window")
 
 
-def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    """Audit selected IDs in a bounded BAM scan; write only new external metadata."""
-    config = load_config(args.config)
+def prepare(
+    args: argparse.Namespace, *, record_observer: Callable[[Any], None] | None = None
+) -> dict[str, Any]:
+    """Audit IDs in a bounded scan; an optional observer sees every BAM record.
+
+    The strict raw-data builder uses the observer for this run's checked moves,
+    avoiding a second scan of the same prefix. Existing CLI behavior is intact.
+    """
+    config = load_config(
+        args.config, cli_data_root=args.data_root, cli_work_root=args.work_root
+    )
     if config.paths.data_root is None or config.paths.work_root is None:
         raise ValueError("Configure data_root/work_root")
     data, work = (
@@ -199,7 +208,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             or row["reference_name"] not in heads
         ):
             raise ValueError(
-                "requires a v4 length_only manifest with known head references"
+                "requires a head-poly length_only manifest with known head references"
             )
         pod5 = Path(row["pod5_path"]).resolve()
         if not pod5.is_relative_to(data) or not pod5.is_file():
@@ -231,7 +240,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "output_dir": str(output),
         "dry_run": args.dry_run,
         "limitations": [
-            "FASTA records are assumed to be construct heads, as in v4 preparation.",
+            "FASTA records are construct heads, as in head-poly preparation.",
             "Exact reference/basecall agreement is selected evidence, "
             "not independent read truth.",
             "Dorado move boundaries and source POD5 metadata remain provisional.",
@@ -267,6 +276,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     ) as records:
         for record in records:
             scanned += 1
+            if record_observer is not None:
+                record_observer(record)
             if (
                 record.is_secondary
                 or record.is_supplementary
@@ -297,7 +308,9 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 raw_length = int(source["raw_signal_length"])
                 stride = int(record.get_tag("mv")[0])
-                if not 0 <= raw_length - int(record.get_tag("ns")) < stride:
+                if not signal_lengths_agree(
+                    raw_length, int(record.get_tag("ns")), stride
+                ):
                     raise ValueError("source_raw_length_disagreement")
                 start, end = window["chunk_start_sample"], window["chunk_end_sample"]
                 if (
@@ -359,6 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
     """Expose explicit existing-manifest, scan and head-window settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--work-root", type=Path)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--dorado-bam", type=Path, required=True)
     parser.add_argument("--reference", type=Path, default=Path("fixed_len_ref.fa"))

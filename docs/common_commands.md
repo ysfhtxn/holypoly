@@ -1,16 +1,29 @@
 # 常用命令
 
-从项目根目录运行。常规实验按[默认流程](default_workflow.md)准备 v4 长度 manifest
+从项目根目录运行。常规实验按[默认流程](default_workflow.md)准备 长度 manifest
 和同源 reference-head 序列 manifest；所有运行产物写入外部 work root。
 下列 `experiment`、`<run>` 为占位名称，必须换成实际配套输入和新输出目录。
+
+## 数据制作预检
+
+```bash
+PYTHONPATH=src src/bonito/.venv/bin/python -m holypoly.datasets.build \
+  --config configs/local.yaml \
+  --bonito-bam basecalls/<sample>/basecalls.bam \
+  --dorado-bam dorado_calls/<sample>/dorado_basecalls.bam \
+  --pod5-dir pod5/<sample> --reference fixed_len_ref.fa \
+  --output-dir metadata/experiment \
+  --poly-types polyA --per-group 20 --max-records 10000
+```
+
+加 `--run` 才制作；联合类型改为 `--poly-types polyA polyT`；可选加
+`--with-timing-reference`。资源与验收见[统一制作方法](prepare_dataset.md)。
 
 ## 联合训练预检
 
 ```bash
 GPU_ID=0 EPOCHS=5 BATCH_SIZE=32 EVAL_BATCH_SIZE=4 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
+bash scripts/run_joint_training.sh --dataset-dir metadata/experiment --dry-run
 ```
 
 确认配置和资源后去掉 `--dry-run`。默认 length/status/basecalling 系数为 1/1/0.1，
@@ -21,9 +34,9 @@ sum pooling + Huber(delta=10 nt)，location 不监督。
 
 ```bash
 EXPERIMENT_ID=<run> EPOCHS=10 GPU_ID=0 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --resume --dry-run
+bash scripts/run_joint_training.sh \
+  metadata/experiment/length/manifest.tsv \
+  metadata/experiment/sequence/sequence_manifest.tsv --resume --dry-run
 ```
 
 `EPOCHS` 是目标总轮数，去掉 `--dry-run` 才继续训练。
@@ -34,7 +47,7 @@ bash scripts/run_reference_joint.sh \
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
 src/bonito/.venv/bin/python -m holypoly.training.evaluate \
-  --config configs/local.yaml --manifest metadata/experiment/manifest.tsv \
+  --config configs/local.yaml --manifest metadata/experiment/length/manifest.tsv \
   --checkpoint models/<run>/heads.epoch_0005.pt \
   --output-dir results/training_evaluation/<run>/test-epoch5-new \
   --split test --batch-size 4 --dry-run

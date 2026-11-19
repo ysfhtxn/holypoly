@@ -1,24 +1,22 @@
 # holypoly
 
 `holypoly` 从 Oxford Nanopore cDNA 原始信号估计 poly(A/T) 候选区域的长度。
-当前使用 Bonito v5 Transformer，常规训练入口是
-`scripts/run_reference_joint.sh`：sum pooling、Huber(delta=10 nt)，联合优化
-length、弱 status 和 reference-head 原生 CTC-CRF；location 不监督。
+当前使用 Bonito v5 Transformer。`scripts/run_joint_training.sh` 联合优化长度、弱状态
+和 reference-head 原生 CTC-CRF。常规 v4 默认使用 sum pooling 和 Huber(delta=10 nt)。
 
 ## 主流程
 
 ```text
 BAM + move table + POD5 + reference head
-  → prepare：v4 长度/状态 manifest
-  → prepare_sequence：同源、同 split 的 reference-head 序列 manifest
-  → run_reference_joint.sh：训练及 validation 选轮
+  → datasets.build：配套长度/状态、head 序列及可选时间参照 manifest
+  → run_joint_training.sh：训练及 validation 选轮
   → training.evaluate：test 预测和弱标签一致性指标
   → plot_training.py：训练曲线和按实际 nt 间距绘制的结果图
 ```
 
 完整命令见[默认流程](docs/default_workflow.md)，日常入口见
 [命令速查](docs/common_commands.md)，文档导航见 [docs/README.md](docs/README.md)。
-数据制作与训练分开执行；训练脚本消费已有的两份 manifest，不重建数据。
+数据制作与训练分开执行。训练入口接收常规 v4、严格候选或完整 head-free 的成品目录。
 
 ## 环境与配置
 
@@ -35,13 +33,11 @@ cp configs/local.example.yaml configs/local.yaml
 本地配置不提交；路径优先级为 CLI > 环境变量 > 本地配置 > 默认配置。
 Torch、POD5 和 Bonito 仅安装在 `src/bonito/.venv`，父环境不安装训练依赖。
 
-两份已审计 manifest 准备好后，先执行只读预检：
+制作完成后先执行只读预检。
 
 ```bash
 GPU_ID=0 EPOCHS=5 \
-bash scripts/run_reference_joint.sh \
-  metadata/experiment/manifest.tsv \
-  metadata/experiment-reference-head/sequence_manifest.tsv --dry-run
+bash scripts/run_joint_training.sh --dataset-dir metadata/experiment --dry-run
 ```
 
 确认输入、规模和资源后，去掉 `--dry-run` 开始训练。物理 GPU 由 `GPU_ID`
@@ -60,9 +56,9 @@ bash scripts/run_reference_joint.sh \
 0-based、左闭右开 `[start_sample, end_sample)`。
 
 新数据采用无设计 flank 的 `head–Poly / raw-edge` 候选定义；候选边缘不代表
-已确认的 Poly 终点。联合 A/T 数据显式使用 `--poly-types polyA polyT --strict-balance`。
+已确认的 Poly 终点。统一入口通过 `--poly-types polyA polyT` 自动严格均衡。
 序列 manifest 必须来自同一长度 manifest，并保留 split 和源 SHA256。
-标签规则见 [v4 数据准备](docs/prepare_dataset_v4.md)。
+标签规则见 [统一数据准备](docs/prepare_dataset.md)。
 
 manifest、审计、信号导出、模型、日志和结果均位于外部 work root。
 原始数据不修改，不复制进仓库。结果按用途存放：
@@ -93,7 +89,7 @@ manifest、审计、信号导出、模型、日志和结果均位于外部 work 
 src/holypoly/
 ├── cli.py                 # 只读体检及历史冻结训练 CLI
 ├── core/                  # 配置、体检和结果路径
-├── datasets/              # v4、reference-head、subset、holdout 准备
+├── datasets/              # 统一数据制作、subset、holdout 准备
 ├── models/                # Bonito v5 包装、Poly heads 和联合模型
 ├── training/              # 数据消费、共享校验、联合训练、评估及历史入口
 ├── inference/             # cDNA 候选和长度预测

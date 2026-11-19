@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="holypoly",
         description=(
             "Nanopore poly(A/T) utilities. Standard training: "
-            "bash scripts/run_reference_joint.sh --help"
+            "bash scripts/run_joint_training.sh --help"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Legacy frozen-encoder training for explicit baselines and resume.",
         description=(
             "Legacy frozen-encoder training. For standard length/status/basecalling "
-            "training use scripts/run_reference_joint.sh; see docs/default_workflow.md."
+            "training use scripts/run_joint_training.sh; see docs/default_workflow.md."
         ),
     )
     train_parser.add_argument(

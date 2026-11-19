@@ -13,7 +13,7 @@
 时长是候选信号的时长，可能包含非 Poly 信号；求和不能自动识别纯 Poly 边界。
 两组均不拼接 `mean_duration` 使用的显式 raw sample 数，因此不是之前三组 loss
 实验中 `mean_duration` 的直接复跑。定位 head、冻结 encoder、原 CRF 和标签不变。
-v4 为 `length_only`，比较原始 `regression_length_nt`；定位和状态没有监督，
+head–Poly manifest 为 `length_only`，比较原始 `regression_length_nt`；定位和状态没有监督，
 不要用状态解码结果判断识别能力。
 
 ## 一键运行
@@ -23,11 +23,11 @@ v4 为 `length_only`，比较原始 `regression_length_nt`；定位和状态没�
 ```bash
 # 只检查 metadata、配置、输出路径和资源估算，不加载信号/模型、不写输出。
 bash scripts/run_length_pooling_ablation.sh \
-  "metadata/<existing-small-v4-dataset>/manifest.tsv" --dry-run
+  "metadata/<existing-small-dataset>/length/manifest.tsv" --dry-run
 
 # 顺序训练两组 → 按验证集 MAE 选择最佳轮 → 测试 → 画图 → 汇总。
 bash scripts/run_length_pooling_ablation.sh \
-  "metadata/<existing-small-v4-dataset>/manifest.tsv"
+  "metadata/<existing-small-dataset>/length/manifest.tsv"
 ```
 
 第二个位置参数可指定配置文件，默认 `configs/local.yaml`。
@@ -38,7 +38,7 @@ bash scripts/run_length_pooling_ablation.sh \
 
 ```bash
 GPU_ID=0 LENGTH_LOSS=mae SEED=17 \
-  bash scripts/run_length_pooling_ablation.sh "metadata/<small-v4-dataset>/manifest.tsv"
+  bash scripts/run_length_pooling_ablation.sh "metadata/<small-dataset>/length/manifest.tsv"
 ```
 
 两组从相同预训练 Bonito 和相同辅助层初始化开始，不从旧实验继续。
